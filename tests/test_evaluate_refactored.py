@@ -1,0 +1,619 @@
+"""
+Unit tests for refactored evaluate.py functions.
+
+Tests cover:
+- EvaluationConfig validation
+- Custom exceptions
+- Helper functions for match_instances
+- Helper functions for score_instance
+- Helper functions for score_submission
+"""
+
+import pytest
+import numpy as np
+from dataclasses import dataclass
+from unittest.mock import Mock, patch, MagicMock
+import zarr
+from upath import UPath
+
+from cellmap_segmentation_challenge.evaluate import (
+    # Configuration
+    EvaluationConfig,
+    # Exceptions
+    EvaluationError,
+    TooManyInstancesError,
+    TooManyOverlapEdgesError,
+    MatchingFailedError,
+    ValidationError,
+    InstanceOverlapData,
+    # Main functions
+    match_instances,
+    score_instance,
+)
+
+from cellmap_segmentation_challenge.utils.eval_utils.instance_matching import (
+    # Helper functions for match_instances
+    _check_instance_counts,
+    _check_instance_ratio,
+    _compute_instance_overlaps,
+    _solve_matching_problem,
+)
+from cellmap_segmentation_challenge.utils.eval_utils.scoring import (
+    # Helper functions for score_instance
+    _compute_binary_metrics,
+    _create_pathological_scores,
+    _compute_hausdorff_scores,
+)
+import zipfile
+
+from cellmap_segmentation_challenge.utils.eval_utils.submission import (
+    # Helper functions for score_submission
+    _prepare_submission,
+    _discover_volumes,
+    _execute_parallel_scoring,
+    _aggregate_and_save_results,
+)
+from cellmap_segmentation_challenge.utils.eval_utils.zip_utils import unzip_file
+
+# ============================================================================
+# Configuration Tests
+# ============================================================================
+
+
+class TestEvaluationConfig:
+    """Test EvaluationConfig dataclass."""
+
+    def test_default_config(self):
+        """Test default configuration values."""
+        config = EvaluationConfig()
+        import os
+        assert config.max_workers == min(os.cpu_count() or 4, 8)
+        assert config.per_instance_threads == 25
+        assert config.max_distance_cap_eps == 1e-4
+        assert config.final_instance_ratio_cutoff == 10.0
+        assert config.initial_instance_ratio_cutoff == 50.0
+        assert config.instance_ratio_factor == 5.0
+        assert config.max_overlap_edges == 5_000_000
+        assert config.mcmf_cost_scale == 1_000_000
+
+    def test_from_env(self, monkeypatch):
+        """Test loading configuration from environment."""
+        monkeypatch.setenv("MAX_WORKERS", "48")
+        monkeypatch.setenv("FINAL_INSTANCE_RATIO_CUTOFF", "15.0")
+
+        config = EvaluationConfig.from_env()
+        assert config.max_workers == 48
+        assert config.final_instance_ratio_cutoff == 15.0
+
+    def test_validate_valid_config(self):
+        """Test validation passes for valid config."""
+        config = EvaluationConfig()
+        config.validate()  # Should not raise
+
+    def test_validate_invalid_max_workers(self):
+        """Test validation fails for invalid max_workers."""
+        config = EvaluationConfig(max_workers=0)
+        with pytest.raises(ValueError, match="max_workers must be >= 1"):
+            config.validate()
+
+    def test_validate_invalid_max_distance_cap_eps(self):
+        """Test validation fails for invalid max_distance_cap_eps."""
+        config = EvaluationConfig(max_distance_cap_eps=0)
+        with pytest.raises(ValueError, match="max_distance_cap_eps must be > 0"):
+            config.validate()
+
+    def test_validate_invalid_final_ratio_cutoff(self):
+        """Test validation fails for invalid final_instance_ratio_cutoff."""
+        config = EvaluationConfig(final_instance_ratio_cutoff=-1)
+        with pytest.raises(ValueError, match="final_instance_ratio_cutoff must be > 0"):
+            config.validate()
+
+    def test_validate_invalid_max_overlap_edges(self):
+        """Test validation fails for invalid max_overlap_edges."""
+        config = EvaluationConfig(max_overlap_edges=0)
+        with pytest.raises(ValueError, match="max_overlap_edges must be >= 1"):
+            config.validate()
+
+
+# ============================================================================
+# Exception Tests
+# ============================================================================
+
+
+class TestCustomExceptions:
+    """Test custom exception hierarchy."""
+
+    def test_too_many_instances_error(self):
+        """Test TooManyInstancesError attributes."""
+        error = TooManyInstancesError(n_pred=100, n_gt=10, ratio=10.0, cutoff=5.0)
+        assert error.n_pred == 100
+        assert error.n_gt == 10
+        assert error.ratio == 10.0
+        assert error.cutoff == 5.0
+        assert "100 predicted vs 10 ground truth" in str(error)
+        assert isinstance(error, EvaluationError)
+
+    def test_too_many_overlap_edges_error(self):
+        """Test TooManyOverlapEdgesError attributes."""
+        error = TooManyOverlapEdgesError(n_edges=10_000_000, max_edges=5_000_000)
+        assert error.n_edges == 10_000_000
+        assert error.max_edges == 5_000_000
+        assert "10000000 exceeds maximum 5000000" in str(error)
+        assert isinstance(error, EvaluationError)
+
+    def test_matching_failed_error(self):
+        """Test MatchingFailedError attributes."""
+        error = MatchingFailedError(status=2)
+        assert error.status == 2
+        assert "status: 2" in str(error)
+        assert isinstance(error, EvaluationError)
+
+    def test_validation_error(self):
+        """Test ValidationError."""
+        error = ValidationError("Test validation error")
+        assert isinstance(error, EvaluationError)
+
+
+# ============================================================================
+# match_instances Helper Function Tests
+# ============================================================================
+
+
+class TestMatchInstancesHelpers:
+    """Test helper functions for match_instances."""
+
+    def test_check_instance_counts_both_zero(self):
+        """Test check_instance_counts when both are zero."""
+        assert not _check_instance_counts(0, 0)
+
+    def test_check_instance_counts_gt_zero_pred_nonzero(self):
+        """Test check_instance_counts when GT is zero."""
+        assert not _check_instance_counts(0, 5)
+
+    def test_check_instance_counts_gt_nonzero_pred_zero(self):
+        """Test check_instance_counts when pred is zero."""
+        assert not _check_instance_counts(5, 0)
+
+    def test_check_instance_counts_both_nonzero(self):
+        """Test check_instance_counts when both are nonzero."""
+        assert _check_instance_counts(5, 5)
+
+    def test_check_instance_ratio_within_bounds(self):
+        """Test ratio check passes when within bounds."""
+        config = EvaluationConfig()
+        # Ratio of 2:1 should be within bounds for 10 GT instances
+        _check_instance_ratio(20, 10, config)  # Should not raise
+
+    def test_check_instance_ratio_exceeds_bounds(self):
+        """Test ratio check fails when exceeds bounds."""
+        config = EvaluationConfig(
+            final_instance_ratio_cutoff=2.0, initial_instance_ratio_cutoff=5.0
+        )
+        # Ratio of 100:1 should exceed bounds
+        with pytest.raises(TooManyInstancesError):
+            _check_instance_ratio(100, 1, config)
+
+    def test_compute_instance_overlaps_no_overlaps(self):
+        """Test overlap computation with no overlaps."""
+        # GT has instance 1 in top-left, pred has instance 1 in bottom-right (no overlap)
+        gt = np.array([[1, 1], [0, 0]])
+        pred = np.array([[0, 0], [1, 1]])
+
+        overlap_data = _compute_instance_overlaps(gt, pred, nG=1, nP=1, max_edges=1000)
+
+        assert overlap_data.nG == 1
+        assert overlap_data.nP == 1
+        assert len(overlap_data.rows) == 0
+        assert len(overlap_data.cols) == 0
+        assert len(overlap_data.iou_vals) == 0
+
+    def test_compute_instance_overlaps_with_overlaps(self):
+        """Test overlap computation with overlaps."""
+        gt = np.array([[1, 1], [0, 0]])
+        pred = np.array([[1, 1], [0, 0]])
+
+        overlap_data = _compute_instance_overlaps(gt, pred, nG=1, nP=1, max_edges=1000)
+
+        assert overlap_data.nG == 1
+        assert overlap_data.nP == 1
+        assert len(overlap_data.rows) == 1
+        assert len(overlap_data.cols) == 1
+        assert overlap_data.iou_vals[0] == pytest.approx(1.0)  # Perfect overlap
+
+    def test_compute_instance_overlaps_too_many_edges(self):
+        """Test overlap computation fails with too many edges."""
+        # Create many small instances to exceed edge limit
+        gt = np.arange(100).reshape(10, 10)
+        pred = np.arange(100).reshape(10, 10)
+
+        with pytest.raises(TooManyOverlapEdgesError):
+            _compute_instance_overlaps(gt, pred, nG=100, nP=100, max_edges=10)
+
+    def test_solve_matching_problem_simple(self):
+        """Test min-cost flow matching with simple case."""
+        # Create overlap data for perfect match
+        overlap_data = InstanceOverlapData(
+            nG=2,
+            nP=2,
+            rows=np.array([0, 1]),
+            cols=np.array([0, 1]),
+            iou_vals=np.array([1.0, 1.0], dtype=np.float32),
+        )
+
+        mapping = _solve_matching_problem(overlap_data, cost_scale=1000000)
+
+        # Should map pred 1->gt 1 and pred 2->gt 2
+        assert mapping[1] == 1
+        assert mapping[2] == 2
+
+
+# ============================================================================
+# score_instance Helper Function Tests
+# ============================================================================
+
+
+class TestScoreInstanceHelpers:
+    """Test helper functions for score_instance."""
+
+    def test_compute_binary_metrics_perfect_match(self):
+        """Test binary metrics with perfect match."""
+        truth = np.array([[1, 1], [0, 0]])
+        pred = np.array([[1, 1], [0, 0]])
+
+        metrics = _compute_binary_metrics(truth, pred)
+
+        assert metrics["iou"] == pytest.approx(1.0)
+        assert metrics["dice_score"] == pytest.approx(1.0)
+        assert metrics["binary_accuracy"] == pytest.approx(1.0)
+
+    def test_compute_binary_metrics_no_overlap(self):
+        """Test binary metrics with no overlap."""
+        truth = np.array([[1, 1], [0, 0]])
+        pred = np.array([[0, 0], [1, 1]])
+
+        metrics = _compute_binary_metrics(truth, pred)
+
+        assert metrics["iou"] == 0.0
+        assert metrics["binary_accuracy"] == 0.0
+
+    def test_create_pathological_scores(self):
+        """Test creation of pathological scores."""
+        binary_metrics = {"iou": 0.5, "dice_score": 0.6, "binary_accuracy": 0.7}
+
+        scores = _create_pathological_scores(
+            binary_metrics,
+            hausdorff_distance_max=100.0,
+            voxel_size=(4.0, 4.0, 4.0),
+            status="test_failure",
+        )
+
+        assert scores["f1"] == 0.0
+        assert scores["combined_score"] == 0
+        assert scores["hausdorff_distance"] == 100.0
+        assert scores["iou"] == 0.5
+        assert scores["status"] == "test_failure"
+
+    def test_compute_hausdorff_scores_only_background(self):
+        """Test Hausdorff score computation with only background."""
+        mapping = {0: 0}
+        truth = np.zeros((10, 10))
+        pred = np.zeros((10, 10))
+
+        distances = _compute_hausdorff_scores(
+            mapping,
+            truth,
+            pred,
+            n_pred=0,
+            voxel_size=(4.0, 4.0),
+            hausdorff_distance_max=100.0,
+        )
+
+        assert distances == [pytest.approx(0.0)]
+
+    def test_compute_hausdorff_scores_no_mapping(self):
+        """Test Hausdorff score computation with no mapping."""
+        mapping = {}
+        truth = np.zeros((10, 10))
+        pred = np.zeros((10, 10))
+
+        distances = _compute_hausdorff_scores(
+            mapping,
+            truth,
+            pred,
+            n_pred=5,
+            voxel_size=(4.0, 4.0),
+            hausdorff_distance_max=100.0,
+        )
+
+        assert distances == [100.0]
+
+
+# ============================================================================
+# score_submission Helper Function Tests
+# ============================================================================
+
+
+class TestScoreSubmissionHelpers:
+    """Test helper functions for score_submission."""
+
+    @patch("cellmap_segmentation_challenge.utils.eval_utils.submission.zipfile.is_zipfile", return_value=True)
+    @patch("cellmap_segmentation_challenge.utils.eval_utils.submission.unzip_file")
+    @patch(
+        "cellmap_segmentation_challenge.utils.eval_utils.submission.ensure_valid_submission"
+    )
+    def test_prepare_submission(self, mock_ensure_valid, mock_unzip, mock_is_zipfile):
+        """Test submission preparation with a zip file path (non-existent on disk)."""
+        mock_unzip.return_value = UPath("/tmp/submission.zarr")
+
+        result = _prepare_submission("/tmp/submission.zip")
+
+        mock_is_zipfile.assert_called_once()
+        mock_unzip.assert_called_once_with("/tmp/submission.zip")
+        mock_ensure_valid.assert_called_once()
+        assert isinstance(result, UPath)
+
+    def test_prepare_submission_zip_file(self, tmp_path):
+        """Test _prepare_submission with a real zip file — exercises actual unzip and validate."""
+        # unzip_file extracts to zip_path.with_suffix(".zarr"), so use a distinct tmp dir
+        # to avoid the .zarr dir pre-existing and triggering the early-return in unzip_file.
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+
+        zip_path = work_dir / "submission.zip"
+        # Build a zip containing a minimal valid zarr v2 group (just .zgroup at root)
+        with zipfile.ZipFile(str(zip_path), "w") as zf:
+            zf.writestr(".zgroup", '{"zarr_format": 2}')
+
+        result = _prepare_submission(str(zip_path))
+
+        # unzip_file extracts to <same-dir>/submission.zarr
+        expected_zarr = work_dir / "submission.zarr"
+        assert expected_zarr.exists(), "Extracted zarr directory should exist"
+        assert (expected_zarr / ".zgroup").exists(), ".zgroup should be present after extraction"
+        assert result == UPath(expected_zarr)
+
+    def test_prepare_submission_dir_with_single_zip(self, tmp_path):
+        """Test _prepare_submission with a directory containing one zip file."""
+        # Create a directory with a single zip file inside
+        submission_dir = tmp_path / "input"
+        submission_dir.mkdir()
+        zip_path = submission_dir / "submission.zip"
+        zarr_out = tmp_path / "submission.zarr"
+        zarr_out.mkdir()
+        (zarr_out / ".zgroup").write_text('{"zarr_format": 2}')
+        # Write a real (minimal) zip so zipfile.is_zipfile() recognises it
+        with zipfile.ZipFile(str(zip_path), "w") as zf:
+            zf.writestr("dummy", "content")
+
+        with patch(
+            "cellmap_segmentation_challenge.utils.eval_utils.submission.unzip_file"
+        ) as mock_unzip, patch(
+            "cellmap_segmentation_challenge.utils.eval_utils.submission.ensure_valid_submission"
+        ) as mock_ensure:
+            mock_unzip.return_value = zarr_out
+
+            result = _prepare_submission(str(submission_dir))
+
+            mock_unzip.assert_called_once()
+            # The argument should be the zip file found inside the directory
+            called_arg = mock_unzip.call_args[0][0]
+            assert UPath(called_arg) == UPath(zip_path)
+            mock_ensure.assert_called_once_with(UPath(zarr_out))
+            assert result == UPath(zarr_out)
+
+    def test_prepare_submission_dir_with_multiple_zips_raises(self, tmp_path):
+        """Test _prepare_submission raises ValueError when a directory contains multiple zip files."""
+        submission_dir = tmp_path / "input"
+        submission_dir.mkdir()
+        for name in ("first.zip", "second.zip"):
+            with zipfile.ZipFile(str(submission_dir / name), "w") as zf:
+                zf.writestr("dummy", "content")
+
+        with pytest.raises(ValueError, match="Multiple zip files found in directory"):
+            _prepare_submission(str(submission_dir))
+
+    def test_prepare_submission_plain_directory(self, tmp_path):
+        """Test _prepare_submission with a plain directory (no zip inside)."""
+        submission_dir = tmp_path / "input"
+        submission_dir.mkdir()
+        # Create a valid zarr store structure at the directory root
+        (submission_dir / ".zgroup").write_text('{"zarr_format": 2}')
+
+        with patch(
+            "cellmap_segmentation_challenge.utils.eval_utils.submission.ensure_valid_submission"
+        ) as mock_ensure:
+            result = _prepare_submission(str(submission_dir))
+
+            # unzip_file should NOT have been called
+            mock_ensure.assert_called_once_with(UPath(submission_dir))
+            assert result == UPath(submission_dir)
+
+    def test_prepare_submission_buried_zarr(self, tmp_path):
+        """Test _prepare_submission triggers buried-Zarr flattening via ensure_valid_submission."""
+        submission_dir = tmp_path / "input"
+        submission_dir.mkdir()
+        # Create a buried zarr folder
+        buried = submission_dir / "nested" / "data.zarr"
+        buried.mkdir(parents=True)
+        (buried / ".zgroup").write_text('{"zarr_format": 2}')
+
+        # _prepare_submission should call ensure_valid_submission which moves things
+        result = _prepare_submission(str(submission_dir))
+
+        # After flattening, .zgroup should be at the root
+        assert (submission_dir / ".zgroup").exists()
+        assert result == UPath(submission_dir)
+
+    def test_prepare_submission_missing_zgroup(self, tmp_path):
+        """Test _prepare_submission triggers .zgroup repair via ensure_valid_submission."""
+        submission_dir = tmp_path / "input"
+        submission_dir.mkdir()
+        # Create a zarr-like directory structure without .zgroup
+        (submission_dir / "crop1").mkdir()
+        # zarr.open needs at least a valid store; write a minimal array
+        label_array = zarr.open(
+            str(submission_dir / "crop1" / "label"), mode="w", shape=(4, 4), dtype="u1"
+        )
+        label_array[:] = 0
+
+        result = _prepare_submission(str(submission_dir))
+
+        # .zgroup should have been added
+        assert (submission_dir / ".zgroup").exists()
+        assert result == UPath(submission_dir)
+
+    def test_prepare_submission_multiple_zarr_raises(self, tmp_path):
+        """Test _prepare_submission raises ValueError when multiple .zarr folders exist."""
+        submission_dir = tmp_path / "input"
+        submission_dir.mkdir()
+        for name in ("a.zarr", "b.zarr"):
+            (submission_dir / name).mkdir()
+
+        with pytest.raises(ValueError, match="multiple Zarr folders"):
+            _prepare_submission(str(submission_dir))
+
+    def test_discover_volumes_matching(self, tmp_path):
+        """Test volume discovery with matching volumes."""
+        # Create test directories
+        submission_path = tmp_path / "submission"
+        truth_path = tmp_path / "truth"
+        submission_path.mkdir()
+        truth_path.mkdir()
+
+        (submission_path / "crop1").mkdir()
+        (submission_path / "crop2").mkdir()
+        (truth_path / "crop1").mkdir()
+        (truth_path / "crop2").mkdir()
+        (truth_path / "crop3").mkdir()
+
+        found, missing = _discover_volumes(UPath(submission_path), UPath(truth_path))
+
+        assert set(found) == {"crop1", "crop2"}
+        assert set(missing) == {"crop3"}
+
+    def test_discover_volumes_no_matches(self, tmp_path):
+        """Test volume discovery with no matches raises error."""
+        submission_path = tmp_path / "submission"
+        truth_path = tmp_path / "truth"
+        submission_path.mkdir()
+        truth_path.mkdir()
+
+        (submission_path / "wrong1").mkdir()
+        (truth_path / "crop1").mkdir()
+
+        with pytest.raises(ValueError, match="No volumes found to score"):
+            _discover_volumes(UPath(submission_path), UPath(truth_path))
+
+    def test_aggregate_and_save_results(self, tmp_path):
+        """Test result aggregation and saving."""
+        result_file = str(tmp_path / "results.json")
+        config = EvaluationConfig()
+
+        results = [
+            (
+                "crop1",
+                "label1",
+                {"iou": 0.9, "status": "scored", "is_missing": False},
+            ),
+            ("crop1", "label2", {"iou": 0.8, "status": "scored", "is_missing": False}),
+        ]
+        missing_scores = {}
+
+        with patch(
+            "cellmap_segmentation_challenge.utils.eval_utils.submission.update_scores"
+        ) as mock_update:
+            mock_update.return_value = (
+                {
+                    "overall_score": 0.85,
+                    "overall_instance_score": 0.9,
+                    "overall_semantic_score": 0.8,
+                },
+                {
+                    "overall_score": 0.85,
+                    "overall_instance_score": 0.9,
+                    "overall_semantic_score": 0.8,
+                },
+            )
+
+            scores = _aggregate_and_save_results(
+                results, missing_scores, result_file, config
+            )
+
+            assert scores["overall_score"] == 0.85
+            mock_update.assert_called_once()
+
+
+# ============================================================================
+# unzip_file Tests
+# ============================================================================
+
+
+class TestUnzipFile:
+    """Tests for unzip_file utility."""
+
+    def test_unzip_file_raises_on_directory(self, tmp_path):
+        """Calling unzip_file on a directory should raise ValueError."""
+        with pytest.raises(ValueError, match="Expected a zip file but got a directory"):
+            unzip_file(str(tmp_path))
+
+
+# ============================================================================
+# Integration Tests with New Signatures
+# ============================================================================
+
+
+class TestRefactoredIntegration:
+    """Integration tests for refactored functions."""
+
+    def test_match_instances_with_config(self):
+        """Test match_instances with custom config."""
+        gt = np.array([[1, 1], [0, 0]])
+        pred = np.array([[1, 1], [0, 0]])
+        config = EvaluationConfig(mcmf_cost_scale=500000)
+
+        mapping = match_instances(gt, pred, config=config)
+
+        assert 1 in mapping
+        assert mapping[1] == 1
+
+    def test_match_instances_raises_too_many_instances(self):
+        """Test match_instances raises TooManyInstancesError."""
+        # Create GT with 1 instance, pred with many (same shape)
+        gt = np.ones((10, 10), dtype=int)  # All pixels are instance 1
+        pred = np.arange(100).reshape(10, 10) + 1  # 100 instances
+
+        config = EvaluationConfig(final_instance_ratio_cutoff=2.0)
+
+        with pytest.raises(TooManyInstancesError):
+            match_instances(gt, pred, config=config)
+
+    def test_score_instance_with_config(self):
+        """Test score_instance with custom config."""
+        pred = np.array([[1, 1], [0, 0]])
+        truth = np.array([[1, 1], [0, 0]])
+        voxel_size = (4.0, 4.0)
+
+        config = EvaluationConfig()
+        scores = score_instance(pred, truth, voxel_size, config=config)
+
+        assert "f1" in scores
+        assert "combined_score" in scores
+        assert scores["status"] == "scored"
+
+    def test_score_instance_handles_too_many_instances(self):
+        """Test score_instance handles TooManyInstancesError gracefully."""
+        # Create scenario that triggers TooManyInstancesError (same shape)
+        truth = np.ones((10, 10), dtype=int)  # All pixels are instance 1
+        pred = np.arange(100).reshape(10, 10) + 1  # 100 instances
+        voxel_size = (4.0, 4.0)
+
+        config = EvaluationConfig(final_instance_ratio_cutoff=2.0)
+        scores = score_instance(pred, truth, voxel_size, config=config)
+
+        assert scores["status"] == "skipped_too_many_instances"
+        assert scores["f1"] == 0.0
+        assert scores["combined_score"] == 0
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
