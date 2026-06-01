@@ -160,7 +160,7 @@ def _predict(
         list(dataset_writer_kwargs["input_arrays"].values())[0]["shape"]
     )
     if singleton_dim is not None:
-        test_inputs = squeeze_singleton_dim(test_inputs, singleton_dim + 1)
+        test_inputs = squeeze_singleton_dim(test_inputs, singleton_dim + 2)
     with torch.no_grad():
         test_outputs = model(test_inputs)
     model_returns_class_dict = False

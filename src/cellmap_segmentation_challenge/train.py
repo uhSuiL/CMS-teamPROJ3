@@ -426,6 +426,10 @@ def train(config_path: str):
 
             # Compute the loss
             targets = get_data_from_batch(batch, target_keys, device)
+
+            if outputs.ndim == 5 and targets.ndim == 4 and outputs.shape[2] == 1:
+                outputs = outputs.squeeze(2)
+
             loss = criterion(outputs, targets) / gradient_accumulation_steps
 
             # Backward pass (compute the gradients)
@@ -531,6 +535,10 @@ def train(config_path: str):
 
                     # Compute the loss
                     targets = get_data_from_batch(batch, target_keys, device)
+
+                    if outputs.ndim == 5 and targets.ndim == 4 and outputs.shape[2] == 1:
+                        outputs = outputs.squeeze(2)
+
                     val_score += criterion(outputs, targets).item()
                     i += 1
 
