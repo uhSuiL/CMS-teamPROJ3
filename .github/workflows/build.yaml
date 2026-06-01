@@ -1,0 +1,37 @@
+name: build
+
+on:
+  push:
+    branches: main
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Build image with Dockerfile & repo2docker
+        uses: jupyterhub/repo2docker-action@master
+        with:
+          # Don't push the image during a PR build
+          NO_PUSH: "${{ github.event_name == 'pull_request' }}"
+          # Provide the username and password. These are empty when we are in a PR
+          DOCKER_USERNAME: ${{ github.actor }}
+          DOCKER_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          DOCKER_REGISTRY: "ghcr.io"
+          IMAGE_NAME: janelia-cellmap/cellmap-segmentation-challenge-evaluator
