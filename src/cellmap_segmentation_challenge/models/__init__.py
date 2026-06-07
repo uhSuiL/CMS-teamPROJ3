@@ -7,6 +7,7 @@ from .model_load import (
     get_model,
 )
 from .resnet import ResNet
+from .transunet_model_3D import TransUNet_3D
 from .unet_model_2D import UNet_2D
 from .unet_model_3D import UNet_3D
 from .vitnet import ViTVNet
