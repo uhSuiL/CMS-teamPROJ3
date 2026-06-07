@@ -350,6 +350,7 @@ class Generic_TransUNet_max_ppbp(SegmentationNetwork):
             StackedConvLayers(output_features, final_num_features, 1, self.conv_op, self.conv_kwargs,
                               self.norm_op, self.norm_op_kwargs, self.dropout_op, self.dropout_op_kwargs, self.nonlin,
                               self.nonlin_kwargs, basic_block=basic_block)))
+        bottleneck_features = final_num_features
 
         # if we don't want to do dropout in the localization pathway then we set the dropout prob to zero here
         if not dropout_in_localization:
@@ -434,11 +435,11 @@ class Generic_TransUNet_max_ppbp(SegmentationNetwork):
             config_vit.hidden_size = vit_hidden_size # 768
             config_vit.transformer.mlp_dim = vit_mlp_dim # 3072
             config_vit.transformer.num_heads = vit_num_heads # 12
-            self.conv_more = nn.Conv3d(config_vit.hidden_size, output_features, 1)
+            self.conv_more = nn.Conv3d(config_vit.hidden_size, bottleneck_features, 1)
             num_pool_per_axis = np.prod(np.array(pool_op_kernel_sizes), axis=0)
             num_pool_per_axis = np.log2(num_pool_per_axis).astype(np.uint8)
             feat_size = [int(self.patch_size[0]/2**num_pool_per_axis[0]), int(self.patch_size[1]/2**num_pool_per_axis[1]), int(self.patch_size[2]/2**num_pool_per_axis[2])]
-            self.transformer = Transformer(config_vit, feat_size=feat_size, vis=False, feat_channels=output_features, use_layer_scale=vit_layer_scale)
+            self.transformer = Transformer(config_vit, feat_size=feat_size, vis=False, feat_channels=bottleneck_features, use_layer_scale=vit_layer_scale)
             if is_vit_pretrain:
                 self.transformer.load_from(weights=np.load(config_vit.pretrained_path))
 

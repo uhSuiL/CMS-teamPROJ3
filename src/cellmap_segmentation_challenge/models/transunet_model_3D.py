@@ -161,7 +161,7 @@ class TransUNet_3D(nn.Module):
             deep_supervision=True,
             final_nonlin=nn.Identity(),
             is_max=False,
-            is_max_bottleneck_transformer=False,
+            is_max_bottleneck_transformer=True,
         )
 
     def forward(self, x):

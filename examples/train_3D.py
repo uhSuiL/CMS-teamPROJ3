@@ -23,8 +23,8 @@ from cellmap_segmentation_challenge.models import ResNet, TransUNet_3D, UNet_3D,
 from cellmap_segmentation_challenge.utils import get_tested_classes
 
 # %% Set hyperparameters and other configurations
-learning_rate = 0.0001  # learning rate for the optimizer
-batch_size = 1  # batch size for the dataloader
+learning_rate = 0.0002  # learning rate for the optimizer
+batch_size = 12  # batch size for the dataloader
 input_array_info = {
     "shape": (128, 128, 128),
     "scale": (8, 8, 8),
@@ -33,12 +33,13 @@ target_array_info = {
     "shape": (128, 128, 128),
     "scale": (8, 8, 8),
 }  # shape and voxel size of the data to load for the target
-epochs = 2  # number of epochs to train the model for
-iterations_per_epoch = 5  # number of iterations per epoch
+epochs = 300  # number of epochs to train the model for
+iterations_per_epoch = 200  # number of iterations per epoch
 random_seed = 42  # random seed for reproducibility
 
 # classes = ["nuc", "er"]  # list of classes to segment
-classes = get_tested_classes()  # list of classes to segment
+# classes = get_tested_classes()  # list of classes to segment
+classes = ["endo_lum", "cyto", "endo_mem"]
 
 # # Defining model (comment out all that are not used)
 # # 3D UNet
@@ -51,7 +52,7 @@ classes = get_tested_classes()  # list of classes to segment
 # model_to_load = "3d_resnet"  # name of the pre-trained model to load
 # model = ResNet(ndims=3, output_nc=len(classes))
 
-# 3D TransUNet-style model adapted from the paper implementation
+# # 3D TransUNet-style model adapted from the paper implementation
 model_name = "3d_transunet"  # name of the model to use
 model_to_load = "3d_transunet"  # name of the pre-trained model to load
 model = TransUNet_3D(1, len(classes), img_size=input_array_info["shape"])
@@ -75,7 +76,7 @@ spatial_transforms = {  # dictionary of spatial transformations to apply to the 
 }
 
 # Set a limit to how long the validation can take
-validation_time_limit = 18  # time limit in seconds for the validation step
+validation_time_limit = 25  # time limit in seconds for the validation step
 filter_by_scale = True  # filter the data by scale
 
 if __name__ == "__main__":
