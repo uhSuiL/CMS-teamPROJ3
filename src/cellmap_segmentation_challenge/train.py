@@ -211,6 +211,7 @@ def train(config_path: str):
     criterion = getattr(config, "criterion", torch.nn.BCEWithLogitsLoss)
     criterion_kwargs = getattr(config, "criterion_kwargs", {})
     weight_loss = getattr(config, "weight_loss", True)
+    wrap_loss = getattr(config, "wrap_loss", True)
 
     gradient_accumulation_steps = getattr(
         config, "gradient_accumulation_steps", 1
@@ -351,8 +352,9 @@ def train(config_path: str):
             [s > 1 for s in list(target_array_info.values())[0]["shape"]]
         )
 
-    # Use custom loss function wrapper that handles NaN values in the target. This works with any PyTorch loss function
-    if weight_loss:
+    # Use custom loss function wrapper that handles NaN values in the target.
+    # Multi-class losses can opt out because their target shape differs from BCE.
+    if weight_loss and wrap_loss:
         pos_weight = list(train_loader.dataset.class_weights.values())
         pos_weight = torch.tensor(pos_weight, dtype=torch.float32).to(device).flatten()
 
@@ -361,7 +363,10 @@ def train(config_path: str):
         if spatial_dims == 3:
             pos_weight = pos_weight[..., None]
         criterion_kwargs["pos_weight"] = pos_weight
-    criterion = CellMapLossWrapper(criterion, **criterion_kwargs)
+    if wrap_loss:
+        criterion = CellMapLossWrapper(criterion, **criterion_kwargs)
+    elif isinstance(criterion, type):
+        criterion = criterion(**criterion_kwargs)
 
     input_keys = list(train_loader.dataset.input_arrays.keys())
     target_keys = list(train_loader.dataset.target_arrays.keys())

@@ -20,11 +20,12 @@
 from upath import UPath
 
 from cellmap_segmentation_challenge.models import ResNet, TransUNet_3D, UNet_3D, ViTVNet
+from cellmap_segmentation_challenge.utils.loss import CellMapDiceCELoss
 from cellmap_segmentation_challenge.utils import get_tested_classes
 
 # %% Set hyperparameters and other configurations
 learning_rate = 0.0002  # learning rate for the optimizer
-batch_size = 12  # batch size for the dataloader
+batch_size = 1  # batch size for the dataloader
 input_array_info = {
     "shape": (128, 128, 128),
     "scale": (8, 8, 8),
@@ -33,14 +34,20 @@ target_array_info = {
     "shape": (128, 128, 128),
     "scale": (8, 8, 8),
 }  # shape and voxel size of the data to load for the target
-epochs = 300  # number of epochs to train the model for
-iterations_per_epoch = 200  # number of iterations per epoch
+epochs = 1  # number of epochs to train the model for
+iterations_per_epoch = 2  # number of iterations per epoch
 random_seed = 42  # random seed for reproducibility
 
 # classes = ["nuc", "er"]  # list of classes to segment
 # classes = get_tested_classes()  # list of classes to segment
-classes = ["endo_lum", "cyto", "endo_mem"]
+classes = ["endo_lum", "cyto", "endo_mem", "bg"]
 force_all_classes = True
+
+# control for BCE, CE, and Dice+CE
+criterion = CellMapDiceCELoss
+criterion_kwargs = {"ce_weight": 0.5, "dice_weight": 0.5}
+wrap_loss = False
+weight_loss = False
 
 # # Defining model (comment out all that are not used)
 # # 3D UNet

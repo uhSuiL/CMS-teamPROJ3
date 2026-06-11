@@ -157,11 +157,16 @@ class TransUNet_3D(nn.Module):
             conv_op=nn.Conv3d,
             norm_op=nn.BatchNorm3d,
             dropout_op=nn.Dropout3d,
+            dropout_op_kwargs={"p": 0.05, "inplace": True},
             patch_size=img_size,
             deep_supervision=True,
             final_nonlin=nn.Identity(),
             is_max=False,
             is_max_bottleneck_transformer=True,
+            vit_depth=4,
+            vit_hidden_size=256,
+            vit_mlp_dim=1024,
+            vit_num_heads=8,
         )
 
     def forward(self, x):

@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 
 class CellMapLossWrapper(torch.nn.modules.loss._Loss):
@@ -50,3 +51,86 @@ class CellMapLossWrapper(torch.nn.modules.loss._Loss):
         else:
             loss = self.calc_loss(outputs, targets)  # type: ignore
         return loss
+
+
+class CellMapCrossEntropyLoss(torch.nn.Module):
+    """
+    Multi-class cross entropy for CellMap-style one-channel-per-class targets.
+
+    Converts a target tensor of shape (B, C, ...) into class indices of shape
+    (B, ...) using argmax over the class dimension, then applies CE to raw
+    logits of shape (B, C, ...).
+    """
+
+    def __init__(self, ignore_index: int = -100, **kwargs):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.kwargs = kwargs
+
+    def _target_to_indices(self, targets: torch.Tensor) -> torch.Tensor:
+        valid = targets.isnan().logical_not().any(dim=1)
+        target_indices = targets.nan_to_num(0).argmax(dim=1).long()
+        return target_indices.masked_fill(valid.logical_not(), self.ignore_index)
+
+    def forward(self, outputs: torch.Tensor, targets: torch.Tensor):
+        target_indices = self._target_to_indices(targets)
+        return F.cross_entropy(
+            outputs,
+            target_indices,
+            ignore_index=self.ignore_index,
+            **self.kwargs,
+        )
+
+
+class CellMapDiceCELoss(CellMapCrossEntropyLoss):
+    """Combined Dice + CE loss for mutually exclusive CellMap labels."""
+
+    def __init__(
+        self,
+        ce_weight: float = 1.0,
+        dice_weight: float = 1.0,
+        dice_smooth: float = 1.0,
+        include_background: bool = True,
+        ignore_index: int = -100,
+        **kwargs,
+    ):
+        super().__init__(ignore_index=ignore_index, **kwargs)
+        self.ce_weight = ce_weight
+        self.dice_weight = dice_weight
+        self.dice_smooth = dice_smooth
+        self.include_background = include_background
+
+    def forward(self, outputs: torch.Tensor, targets: torch.Tensor):
+        target_indices = self._target_to_indices(targets)
+        ce_loss = F.cross_entropy(
+            outputs,
+            target_indices,
+            ignore_index=self.ignore_index,
+            **self.kwargs,
+        )
+
+        valid = target_indices != self.ignore_index
+        safe_target = target_indices.masked_fill(valid.logical_not(), 0)
+        target_one_hot = F.one_hot(
+            safe_target, num_classes=outputs.shape[1]
+        ).movedim(-1, 1)
+        target_one_hot = target_one_hot.to(dtype=outputs.dtype)
+        probs = F.softmax(outputs, dim=1)
+
+        valid = valid.unsqueeze(1)
+        probs = probs * valid
+        target_one_hot = target_one_hot * valid
+
+        if not self.include_background and outputs.shape[1] > 1:
+            probs = probs[:, 1:]
+            target_one_hot = target_one_hot[:, 1:]
+
+        reduce_dims = tuple(range(2, outputs.ndim))
+        intersection = (probs * target_one_hot).sum(dim=reduce_dims)
+        denominator = probs.sum(dim=reduce_dims) + target_one_hot.sum(dim=reduce_dims)
+        dice_score = (2 * intersection + self.dice_smooth) / (
+            denominator + self.dice_smooth
+        )
+        dice_loss = 1 - dice_score.mean()
+
+        return self.ce_weight * ce_loss + self.dice_weight * dice_loss
