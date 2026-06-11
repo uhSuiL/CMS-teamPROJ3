@@ -24,6 +24,26 @@ model = TransUNet_3D(1, len(classes), img_size=input_array_info["shape"])
 
 
 
+smaller 3d-transunet
+
+```python
+# old 3dtransunet args
+dropout_op_kwargs={"p": 0.5, "inplace": True}
+vit_depth=12
+vit_hidden_size=768
+vit_mlp_dim=3072
+vit_num_heads=12
+
+# new args
+dropout_op_kwargs={"p": 0.05, "inplace": True}
+vit_depth=4
+vit_hidden_size=256
+vit_mlp_dim=1024
+vit_num_heads=8
+```
+
+
+
 2. loss function has been changed:
 
 loss = BCE --> loss =  0.5 * CE+0.5 * DICE
