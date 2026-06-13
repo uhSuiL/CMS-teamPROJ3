@@ -19,7 +19,13 @@
 # %%
 from upath import UPath
 
-from cellmap_segmentation_challenge.models import ResNet, TransUNet_3D, UNet_3D, ViTVNet
+from cellmap_segmentation_challenge.models import (
+    ResNet,
+    SegFormer3D,
+    TransUNet_3D,
+    UNet_3D,
+    ViTVNet,
+)
 from cellmap_segmentation_challenge.utils.loss import CellMapDiceCELoss
 from cellmap_segmentation_challenge.utils import get_tested_classes
 
@@ -60,10 +66,15 @@ weight_loss = False
 # model_to_load = "3d_resnet"  # name of the pre-trained model to load
 # model = ResNet(ndims=3, output_nc=len(classes))
 
-# # 3D TransUNet-style model adapted from the paper implementation
+# # 3D TransUNet
 model_name = "3d_transunet"  # name of the model to use
 model_to_load = "3d_transunet"  # name of the pre-trained model to load
 model = TransUNet_3D(1, len(classes), img_size=input_array_info["shape"])
+
+# 3D SegFormer
+# model_name = "3d_segformer"
+# model_to_load = "3d_segformer"
+# model = SegFormer3D(in_channels=1, num_classes=len(classes))
 
 load_model = "latest"  # load the latest model or the best validation model
 

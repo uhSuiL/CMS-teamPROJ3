@@ -6,6 +6,8 @@ This directory contains the models used in the CellMap Segmentation Challenge. T
 - UNet_3D
 - ResNet
 - ViTVNet
+- TransUNet_3D
+- SegFormer3D
 
 ## Model Loading
 

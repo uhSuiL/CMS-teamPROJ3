@@ -157,7 +157,7 @@ class TransUNet_3D(nn.Module):
             conv_op=nn.Conv3d,
             norm_op=nn.BatchNorm3d,
             dropout_op=nn.Dropout3d,
-            dropout_op_kwargs={"p": 0.05, "inplace": True},
+            dropout_op_kwargs={"p": 0.01, "inplace": True},
             patch_size=img_size,
             deep_supervision=True,
             final_nonlin=nn.Identity(),
