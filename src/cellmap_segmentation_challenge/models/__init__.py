@@ -6,6 +6,7 @@ from .model_load import (
     newest_wildcard_path,
     get_model,
 )
+from .nnformer_model_3D import NNFormer3D
 from .resnet import ResNet
 from .segformer3d import SegFormer3D
 from .transunet_model_3D import TransUNet_3D

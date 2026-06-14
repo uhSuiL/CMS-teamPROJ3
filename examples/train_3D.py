@@ -20,6 +20,7 @@
 from upath import UPath
 
 from cellmap_segmentation_challenge.models import (
+    NNFormer3D,
     ResNet,
     SegFormer3D,
     TransUNet_3D,
@@ -67,14 +68,19 @@ weight_loss = False
 # model = ResNet(ndims=3, output_nc=len(classes))
 
 # # 3D TransUNet
-model_name = "3d_transunet"  # name of the model to use
-model_to_load = "3d_transunet"  # name of the pre-trained model to load
-model = TransUNet_3D(1, len(classes), img_size=input_array_info["shape"])
+# model_name = "3d_transunet"  # name of the model to use
+# model_to_load = "3d_transunet"  # name of the pre-trained model to load
+# model = TransUNet_3D(1, len(classes), img_size=input_array_info["shape"])
 
 # 3D SegFormer
 # model_name = "3d_segformer"
 # model_to_load = "3d_segformer"
 # model = SegFormer3D(in_channels=1, num_classes=len(classes))
+
+# 3D nnFormer
+model_name = "3d_nnformer"
+model_to_load = "3d_nnformer"
+model = NNFormer3D(1, len(classes), img_size=input_array_info["shape"])
 
 load_model = "latest"  # load the latest model or the best validation model
 
