@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-from typing import Optional
+from typing import Optional, Callable
 
 from post_process.objective import total_cost
 
@@ -29,6 +29,7 @@ def solve_sa(
     T_final: float = 1e-4,
     n_iter: int = 200,
     generator: Optional[torch.Generator] = None,
+    validate_fn: Callable = None,
 ) -> Tensor:
     """
     Black-box simulated annealing for MRF labeling.
@@ -65,9 +66,10 @@ def solve_sa(
     X = -C_unary.to(torch.float64) if X_init is None else X_init.to(torch.float64)
 
     cost = total_cost(C_unary, hard_assign(X, orig_dtype), C_adj)  # (N, 1)
-
     T = float(T_init)
     decay = (T_final / T_init) ** (1.0 / max(n_iter - 1, 1))
+
+    best = {'iter': 0,'X': X, 'cost': cost}
 
     for i in range(n_iter):
         step = step_init * (T / T_init)
@@ -79,17 +81,29 @@ def solve_sa(
         )  # (N, 1)
 
         # Metropolis accept / reject (per sample)
-        delta = cost_prop - cost                                        # (N, 1)
+        delta = cost_prop - cost  # (N, 1)
         log_u = torch.log(
             torch.rand((N, 1), dtype=torch.float64, device=device, generator=generator) + 1e-20
         )
-        accept = (delta <= 0) | (log_u < -delta / T)                   # (N, 1) bool
+        accept = (delta <= 0) | (log_u < -delta / T)  # (N, 1) bool
 
         X    = torch.where(accept.reshape(N, 1, 1, 1, 1), X_prop, X)
         cost = torch.where(accept, cost_prop, cost)
 
         T *= decay
 
-        print(f"Iter {i} | Cost: {cost_prop.mean():.4f}")
 
-    return hard_assign(X, orig_dtype)
+        if cost < best['cost']:
+            best['iter'] = i
+            best['X'] = X
+            best['cost'] = cost
+
+        if validate_fn is not None:
+            valid_result = validate_fn(X)
+            print(f"Iter {i} | Cost: {cost_prop.mean():.4f} | Valid Result: {valid_result}")
+        else:
+            print(f"Iter {i} | Cost: {cost_prop.mean():.4f}")
+
+    print(f"Best Iter: {best['iter']} | Cost: {best['cost']}")
+
+    return hard_assign(best['X'], orig_dtype)
