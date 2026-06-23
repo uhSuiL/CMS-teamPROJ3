@@ -27,7 +27,7 @@ from cellmap_segmentation_challenge.models import (
     UNet_3D,
     ViTVNet,
 )
-from cellmap_segmentation_challenge.utils.loss import CellMapDiceCELoss
+from cellmap_segmentation_challenge.utils.loss import CellMapFocalDiceLoss
 from cellmap_segmentation_challenge.utils import get_tested_classes
 
 # %% Set hyperparameters and other configurations
@@ -41,8 +41,8 @@ target_array_info = {
     "shape": (128, 128, 128),
     "scale": (8, 8, 8),
 }  # shape and voxel size of the data to load for the target
-epochs = 1  # number of epochs to train the model for
-iterations_per_epoch = 2  # number of iterations per epoch
+epochs = 100  # number of epochs to train the model for
+iterations_per_epoch = 3  # number of iterations per epoch
 random_seed = 42  # random seed for reproducibility
 
 # classes = ["nuc", "er"]  # list of classes to segment
@@ -50,11 +50,16 @@ random_seed = 42  # random seed for reproducibility
 classes = ["endo_lum", "cyto", "endo_mem", "bg"]
 force_all_classes = True
 
-# control for BCE, CE, and Dice+CE
-criterion = CellMapDiceCELoss
-criterion_kwargs = {"ce_weight": 0.5, "dice_weight": 0.5}
-wrap_loss = False
-weight_loss = False
+# control for BCE, CE, Dice+CE, and Focal+Dice
+criterion = CellMapFocalDiceLoss
+# criterion_kwargs = {
+#     "alpha": [2.5, 1.5, 2.5, 1.0],  # ["endo_lum", "cyto", "endo_mem", "bg"]
+#     "gamma": 1.0,
+#     "focal_weight": 0.8,
+#     "dice_weight": 0.2,
+# }
+# wrap_loss = False
+# weight_loss = False
 
 # # Defining model (comment out all that are not used)
 # # 3D UNet
@@ -68,9 +73,9 @@ weight_loss = False
 # model = ResNet(ndims=3, output_nc=len(classes))
 
 # # 3D TransUNet
-# model_name = "3d_transunet"  # name of the model to use
-# model_to_load = "3d_transunet"  # name of the pre-trained model to load
-# model = TransUNet_3D(1, len(classes), img_size=input_array_info["shape"])
+model_name = "3d_transunet"  # name of the model to use
+model_to_load = "3d_transunet"  # name of the pre-trained model to load
+model = TransUNet_3D(1, len(classes), img_size=input_array_info["shape"])
 
 # 3D SegFormer
 # model_name = "3d_segformer"
@@ -78,9 +83,9 @@ weight_loss = False
 # model = SegFormer3D(in_channels=1, num_classes=len(classes))
 
 # 3D nnFormer
-model_name = "3d_nnformer"
-model_to_load = "3d_nnformer"
-model = NNFormer3D(1, len(classes), img_size=input_array_info["shape"])
+# model_name = "3d_nnformer"
+# model_to_load = "3d_nnformer"
+# model = NNFormer3D(1, len(classes), img_size=input_array_info["shape"])
 
 load_model = "latest"  # load the latest model or the best validation model
 

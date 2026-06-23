@@ -1,9 +1,11 @@
 import copy
+import itertools
 import os
 import tempfile
 from glob import glob
 from typing import Any
 
+import numpy as np
 import torch
 import torchvision.transforms.v2 as T
 from cellmap_data import CellMapDatasetWriter, CellMapImage
@@ -29,6 +31,319 @@ from .utils import (
     unsqueeze_singleton_dim,
 )
 from .utils.datasplit import get_formatted_fields, get_raw_path
+
+
+def _merge_bounds(
+    current: dict[str, tuple[float, float]] | None,
+    new_bounds: dict[str, tuple[float, float]],
+) -> dict[str, tuple[float, float]]:
+    if current is None:
+        return {axis: (float(lo), float(hi)) for axis, (lo, hi) in new_bounds.items()}
+    merged = dict(current)
+    for axis, (lo, hi) in new_bounds.items():
+        if axis in merged:
+            old_lo, old_hi = merged[axis]
+            merged[axis] = (min(old_lo, float(lo)), max(old_hi, float(hi)))
+        else:
+            merged[axis] = (float(lo), float(hi))
+    return merged
+
+
+def _get_crop_target_bounds(
+    crop_path: str,
+    classes: list[str],
+    target_arrays: dict[str, dict],
+) -> dict[str, dict[str, tuple[float, float]]]:
+    """Infer crop bounds from all available label arrays, not only classes[0]."""
+    target_bounds = {}
+    for array_name, array_info in target_arrays.items():
+        bounds = None
+        for label in classes:
+            label_path = UPath(crop_path) / label
+            try:
+                image = CellMapImage(
+                    str(label_path),
+                    target_class=label,
+                    target_scale=array_info["scale"],
+                    target_voxel_shape=array_info["shape"],
+                    pad=True,
+                    pad_value=0,
+                )
+                bounds = _merge_bounds(bounds, image.bounding_box)
+            except Exception:
+                continue
+        if bounds is None:
+            raise ValueError(
+                f"Could not infer target bounds for {crop_path}. None of the "
+                f"requested classes were readable: {classes}."
+            )
+        target_bounds[array_name] = bounds
+    return target_bounds
+
+
+def _get_dense_writer_indices(dataset_writer: CellMapDatasetWriter) -> list[int]:
+    """Tile prediction centers so the full output extent is covered.
+
+    CellMapDatasetWriter's default writer_indices use roughly one tile per
+    patch-sized span of the shrunken sampling box. For crops like 200^3 with
+    128^3 patches this can produce a single write tile, leaving the margins
+    unwritten. This helper uses enough edge-aligned centers to cover the whole
+    output array while still writing normal patch-sized predictions.
+    """
+    sb = dataset_writer.sampling_box
+    bb = dataset_writer.bounding_box
+    if sb is None or bb is None:
+        return []
+
+    axes = list(sb.keys())
+    scale = dataset_writer._write_scale
+    patch_shape = dataset_writer._write_voxel_shape
+    grid_shape = {
+        axis: max(1, int(round((sb[axis][1] - sb[axis][0]) / scale[axis])))
+        for axis in axes
+    }
+
+    per_axis_positions = []
+    for axis in axes:
+        full_voxels = max(1, int(round((bb[axis][1] - bb[axis][0]) / scale[axis])))
+        patch_voxels = max(1, int(patch_shape[axis]))
+        center_grid = grid_shape[axis]
+        if full_voxels <= patch_voxels or center_grid <= 1:
+            per_axis_positions.append([0])
+            continue
+
+        max_start = full_voxels - patch_voxels
+        n_tiles = int(np.ceil(full_voxels / patch_voxels))
+        starts = sorted(
+            {int(round(start)) for start in np.linspace(0, max_start, n_tiles)}
+        )
+        positions = sorted(
+            {
+                int(round(start * (center_grid - 1) / max_start))
+                for start in starts
+            }
+        )
+        per_axis_positions.append(positions)
+
+    shape_tuple = tuple(grid_shape[axis] for axis in axes)
+    indices = []
+    for coords in itertools.product(*per_axis_positions):
+        flat = 0
+        for coord, dim in zip(coords, shape_tuple):
+            flat = flat * dim + coord
+        indices.append(flat)
+    return indices
+
+
+def _writer_patch_slices(writer, center: dict[str, float], data: np.ndarray):
+    """Return destination/source slices for writing one patch."""
+    arr_shape = [writer.shape[c] for c in writer.spatial_axes]
+
+    dst_slices = []
+    src_slices = []
+    for i, axis in enumerate(writer.spatial_axes):
+        start_nm = center[axis] - writer.write_world_shape[axis] / 2.0
+        start_vox = int(round((start_nm - writer.offset[axis]) / writer.scale[axis]))
+        end_vox = start_vox + writer.write_voxel_shape[axis]
+        clamp_start = max(0, start_vox)
+        clamp_end = min(arr_shape[i], end_vox)
+        dst_slices.append(slice(clamp_start, clamp_end))
+        src_start = clamp_start - start_vox
+        src_slices.append(slice(src_start, src_start + clamp_end - clamp_start))
+
+    while data.ndim > len(writer.spatial_axes) and data.shape[0] == 1:
+        data = np.squeeze(data, axis=0)
+
+    actual = tuple(s.stop - s.start for s in dst_slices)
+    if data.shape != actual:
+        data = data[tuple(src_slices)]
+
+    return tuple(dst_slices), tuple(src_slices), data
+
+
+def _blend_weight(shape: tuple[int, ...]) -> np.ndarray:
+    """Use equal weights so only overlapping voxels are averaged."""
+    return np.ones(shape, dtype=np.float32)
+
+
+def _select_prediction_batch_item(
+    outputs: dict[str, Any],
+    batch_index: int,
+) -> dict[str, Any]:
+    """Select one prediction item while preserving the writer's dict structure."""
+    item = {}
+    for array_name, class_outputs in outputs.items():
+        if isinstance(class_outputs, dict):
+            item[array_name] = {
+                class_name: tensor[batch_index]
+                for class_name, tensor in class_outputs.items()
+            }
+        else:
+            item[array_name] = class_outputs[batch_index]
+    return item
+
+
+def _get_owned_prediction_tiles(
+    dataset_writer: CellMapDatasetWriter,
+) -> list[dict[str, Any]]:
+    """Split the output into disjoint regions owned by centered input patches."""
+    first_array_writers = next(iter(dataset_writer.target_array_writers.values()))
+    first_writer = next(iter(first_array_writers.values()))
+    axes = list(first_writer.spatial_axes)
+    output_shape = tuple(int(first_writer.shape[axis]) for axis in axes)
+    patch_shape = tuple(int(first_writer.write_voxel_shape[axis]) for axis in axes)
+
+    per_axis_regions = []
+    for full_size, patch_size in zip(output_shape, patch_shape):
+        n_tiles = max(1, int(np.ceil(full_size / patch_size)))
+        boundaries = np.rint(np.linspace(0, full_size, n_tiles + 1)).astype(int)
+        per_axis_regions.append(
+            [(int(boundaries[i]), int(boundaries[i + 1])) for i in range(n_tiles)]
+        )
+
+    tiles = []
+    for regions in itertools.product(*per_axis_regions):
+        center = {}
+        dst_slices = []
+        src_slices = []
+        for axis_index, (axis, region) in enumerate(zip(axes, regions)):
+            region_start, region_stop = region
+            region_center = (region_start + region_stop) / 2.0
+            center[axis] = (
+                float(first_writer.offset[axis])
+                + region_center * float(first_writer.scale[axis])
+            )
+
+            patch_start = int(
+                np.floor(region_center - patch_shape[axis_index] / 2.0)
+            )
+            src_start = region_start - patch_start
+            src_stop = src_start + region_stop - region_start
+            dst_slices.append(slice(region_start, region_stop))
+            src_slices.append(slice(src_start, src_stop))
+
+        tiles.append(
+            {
+                "center": center,
+                "dst_slices": tuple(dst_slices),
+                "src_slices": tuple(src_slices),
+            }
+        )
+    return tiles
+
+
+def _load_prediction_tile_batch(
+    dataset_writer: CellMapDatasetWriter,
+    tiles: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Load model inputs at the centers of a batch of owned output tiles."""
+    batch = {}
+    for array_name, source in dataset_writer.input_sources.items():
+        patches = []
+        for tile in tiles:
+            patch = source[tile["center"]]
+            if patch.ndim > 0 and patch.shape[0] != 1:
+                patch = patch.unsqueeze(0)
+            patches.append(patch)
+        batch[array_name] = torch.stack(patches)
+    return batch
+
+
+def _write_owned_prediction_tile(
+    dataset_writer: CellMapDatasetWriter,
+    tile: dict[str, Any],
+    outputs: dict[str, Any],
+) -> None:
+    """Write only the disjoint responsibility region of one prediction patch."""
+    for array_name, class_outputs in outputs.items():
+        if array_name not in dataset_writer.target_array_writers:
+            continue
+        writers = dataset_writer.target_array_writers[array_name]
+
+        if isinstance(class_outputs, dict):
+            items = class_outputs.items()
+        else:
+            items = (
+                (cls, class_outputs[i : i + 1])
+                for i, cls in enumerate(dataset_writer.model_classes)
+                if class_outputs.ndim > 0 and class_outputs.shape[0] > i
+            )
+
+        for cls, tensor in items:
+            if cls not in writers:
+                continue
+            writer = writers[cls]
+            data = (
+                tensor.detach().cpu().numpy()
+                if torch.is_tensor(tensor)
+                else np.asarray(tensor)
+            )
+            while data.ndim > len(writer.spatial_axes) and data.shape[0] == 1:
+                data = np.squeeze(data, axis=0)
+            writer._zarr_array[tile["dst_slices"]] = data[tile["src_slices"]].astype(
+                writer._zarr_array.dtype
+            )
+
+
+def _accumulate_prediction_patch(
+    dataset_writer: CellMapDatasetWriter,
+    idx: int,
+    outputs: dict[str, Any],
+    weight_sums: dict[str, np.ndarray],
+) -> None:
+    """Accumulate overlapping raw logits for later averaging."""
+    center = dataset_writer.get_center(int(idx))
+
+    for array_name, class_outputs in outputs.items():
+        if array_name not in dataset_writer.target_array_writers:
+            continue
+        writers = dataset_writer.target_array_writers[array_name]
+
+        if isinstance(class_outputs, dict):
+            items = class_outputs.items()
+        else:
+            items = (
+                (cls, class_outputs[i : i + 1])
+                for i, cls in enumerate(dataset_writer.model_classes)
+                if class_outputs.ndim > 0 and class_outputs.shape[0] > i
+            )
+
+        count_updated = False
+        for cls, tensor in items:
+            if cls not in writers:
+                continue
+            writer = writers[cls]
+            data = tensor.detach().cpu().numpy() if torch.is_tensor(tensor) else np.asarray(tensor)
+            dst_slices, src_slices, data = _writer_patch_slices(writer, center, data)
+            full_patch_shape = tuple(
+                int(writer.write_voxel_shape[axis]) for axis in writer.spatial_axes
+            )
+            blend_weight = _blend_weight(full_patch_shape)[src_slices]
+            arr = writer._zarr_array
+            arr[dst_slices] = np.asarray(arr[dst_slices]) + (
+                data.astype(np.float32) * blend_weight
+            ).astype(arr.dtype)
+
+            if not count_updated:
+                weight_sums[array_name][dst_slices] += blend_weight
+                count_updated = True
+
+
+def _average_accumulated_predictions(
+    dataset_writer: CellMapDatasetWriter,
+    weight_sums: dict[str, np.ndarray],
+) -> None:
+    """Divide accumulated logits by per-voxel blending weights."""
+    for array_name, class_writers in dataset_writer.target_array_writers.items():
+        weight_sum = weight_sums[array_name]
+        covered = weight_sum > 0
+        if not np.any(covered):
+            continue
+        for writer in class_writers.values():
+            arr = writer._zarr_array
+            data = np.asarray(arr[:])
+            data[covered] = data[covered] / weight_sum[covered]
+            arr[:] = data.astype(arr.dtype)
 
 
 def predict_orthoplanes(
@@ -220,13 +535,21 @@ def _predict(
         k: v for k, v in dataset_writer_kwargs.items() if k != "model_classes"
     }
     dataset_writer = CellMapDatasetWriter(**dataset_writer_kwargs)
-    dataloader = dataset_writer.loader(batch_size=batch_size)
+    owned_tiles = _get_owned_prediction_tiles(dataset_writer)
+    for class_writers in dataset_writer.target_array_writers.values():
+        for writer in class_writers.values():
+            writer._zarr_array[:] = 0
 
     # Find singleton dimension if there is one
     # Only the first singleton dimension will be used for squeezing/unsqueezing.
     # If there are multiple singleton dimensions, only the first is handled.
     with torch.no_grad():
-        for batch in tqdm(dataloader, dynamic_ncols=True):
+        tile_batches = [
+            owned_tiles[start : start + batch_size]
+            for start in range(0, len(owned_tiles), batch_size)
+        ]
+        for tiles in tqdm(tile_batches, dynamic_ncols=True):
+            batch = _load_prediction_tile_batch(dataset_writer, tiles)
             # Get the inputs, handling dict vs. tensor data
             inputs = get_data_from_batch(batch, input_keys, device)
             if singleton_dim is not None:
@@ -266,8 +589,15 @@ def _predict(
                         ]
                 outputs = filtered_outputs
 
-            # Save the outputs
-            dataset_writer[batch["idx"]] = outputs
+            # Each patch writes only its disjoint responsibility region. The
+            # remaining patch margin is context and is discarded.
+            for batch_index, tile in enumerate(tiles):
+                item_outputs = _select_prediction_batch_item(outputs, batch_index)
+                _write_owned_prediction_tile(
+                    dataset_writer,
+                    tile,
+                    item_outputs,
+                )
 
 
 def _estimate_output_bytes(
@@ -530,23 +860,14 @@ def predict(
                 # Get path to raw dataset
                 raw_path = get_raw_path(crop_path, label="")
 
-                # Get the boundaries of the crop
-                gt_images = {
-                    array_name: CellMapImage(
-                        str(UPath(crop_path) / classes[0]),
-                        target_class=classes[0],
-                        target_scale=array_info["scale"],
-                        target_voxel_shape=array_info["shape"],
-                        pad=True,
-                        pad_value=0,
-                    )
-                    for array_name, array_info in target_arrays.items()
-                }
-
-                target_bounds = {
-                    array_name: image.bounding_box
-                    for array_name, image in gt_images.items()
-                }
+                # Get the boundaries of the crop from every readable label.
+                # Using only classes[0] is fragile when the first class is rare
+                # or missing for a crop.
+                target_bounds = _get_crop_target_bounds(
+                    crop_path,
+                    classes,
+                    target_arrays,
+                )
 
                 dataset = get_formatted_fields(raw_path, search_path, ["{dataset}"])[
                     "dataset"

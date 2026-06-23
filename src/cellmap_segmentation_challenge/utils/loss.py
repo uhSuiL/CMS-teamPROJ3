@@ -91,6 +91,7 @@ class CellMapDiceCELoss(CellMapCrossEntropyLoss):
         dice_weight: float = 1.0,
         dice_smooth: float = 1.0,
         include_background: bool = True,
+        class_weights: list[float] | tuple[float, ...] | torch.Tensor | None = None,
         ignore_index: int = -100,
         **kwargs,
     ):
@@ -99,12 +100,21 @@ class CellMapDiceCELoss(CellMapCrossEntropyLoss):
         self.dice_weight = dice_weight
         self.dice_smooth = dice_smooth
         self.include_background = include_background
+        self.class_weights = (
+            None if class_weights is None else torch.as_tensor(class_weights, dtype=torch.float32)
+        )
 
     def forward(self, outputs: torch.Tensor, targets: torch.Tensor):
         target_indices = self._target_to_indices(targets)
+        weight = (
+            None
+            if self.class_weights is None
+            else self.class_weights.to(device=outputs.device, dtype=outputs.dtype)
+        )
         ce_loss = F.cross_entropy(
             outputs,
             target_indices,
+            weight=weight,
             ignore_index=self.ignore_index,
             **self.kwargs,
         )
@@ -134,3 +144,72 @@ class CellMapDiceCELoss(CellMapCrossEntropyLoss):
         dice_loss = 1 - dice_score.mean()
 
         return self.ce_weight * ce_loss + self.dice_weight * dice_loss
+
+
+class CellMapFocalDiceLoss(CellMapCrossEntropyLoss):
+    """Combined focal + Dice loss for imbalanced mutually exclusive labels."""
+
+    def __init__(
+        self,
+        alpha: list[float] | tuple[float, ...] | torch.Tensor | None = None,
+        gamma: float = 1.5,
+        focal_weight: float = 0.75,
+        dice_weight: float = 0.25,
+        dice_smooth: float = 1.0,
+        include_background: bool = True,
+        ignore_index: int = -100,
+        **kwargs,
+    ):
+        super().__init__(ignore_index=ignore_index, **kwargs)
+        self.alpha = None if alpha is None else torch.as_tensor(alpha, dtype=torch.float32)
+        self.gamma = gamma
+        self.focal_weight = focal_weight
+        self.dice_weight = dice_weight
+        self.dice_smooth = dice_smooth
+        self.include_background = include_background
+
+    def forward(self, outputs: torch.Tensor, targets: torch.Tensor):
+        target_indices = self._target_to_indices(targets)
+        valid = target_indices != self.ignore_index
+        safe_target = target_indices.masked_fill(valid.logical_not(), 0)
+
+        ce_loss = F.cross_entropy(
+            outputs,
+            target_indices,
+            ignore_index=self.ignore_index,
+            reduction="none",
+            **self.kwargs,
+        )
+        pt = torch.exp(-ce_loss)
+        focal_loss = (1 - pt).pow(self.gamma) * ce_loss
+
+        if self.alpha is not None:
+            alpha = self.alpha.to(device=outputs.device, dtype=outputs.dtype)
+            alpha_t = alpha[safe_target]
+            focal_loss = alpha_t * focal_loss
+
+        focal_loss = focal_loss[valid].mean()
+
+        target_one_hot = F.one_hot(
+            safe_target, num_classes=outputs.shape[1]
+        ).movedim(-1, 1)
+        target_one_hot = target_one_hot.to(dtype=outputs.dtype)
+        probs = F.softmax(outputs, dim=1)
+
+        valid = valid.unsqueeze(1)
+        probs = probs * valid
+        target_one_hot = target_one_hot * valid
+
+        if not self.include_background and outputs.shape[1] > 1:
+            probs = probs[:, 1:]
+            target_one_hot = target_one_hot[:, 1:]
+
+        reduce_dims = tuple(range(2, outputs.ndim))
+        intersection = (probs * target_one_hot).sum(dim=reduce_dims)
+        denominator = probs.sum(dim=reduce_dims) + target_one_hot.sum(dim=reduce_dims)
+        dice_score = (2 * intersection + self.dice_smooth) / (
+            denominator + self.dice_smooth
+        )
+        dice_loss = 1 - dice_score.mean()
+
+        return self.focal_weight * focal_loss + self.dice_weight * dice_loss
