@@ -82,6 +82,162 @@ class CellMapCrossEntropyLoss(torch.nn.Module):
         )
 
 
+class CellMapDynamicWeightedCrossEntropyLoss(CellMapCrossEntropyLoss):
+    """Patch-wise inverse-frequency weighted cross-entropy.
+
+    For each patch independently, an active class ``c`` receives weight
+    ``N / (C_active * n_c)``, where ``N`` is the number of valid voxels,
+    ``C_active`` is the number of classes present in the patch, and ``n_c`` is
+    the class voxel count. Missing classes receive weight zero. Optional lower
+    and upper bounds control majority-class downweighting and rare-class
+    amplification.
+    """
+
+    def __init__(
+        self,
+        min_class_weight: float | None = None,
+        max_class_weight: float | None = 25.0,
+        ignore_index: int = -100,
+        **kwargs,
+    ):
+        super().__init__(ignore_index=ignore_index, **kwargs)
+        if min_class_weight is not None and min_class_weight <= 0:
+            raise ValueError("min_class_weight must be positive or None")
+        if max_class_weight is not None and max_class_weight <= 0:
+            raise ValueError("max_class_weight must be positive or None")
+        if (
+            min_class_weight is not None
+            and max_class_weight is not None
+            and min_class_weight > max_class_weight
+        ):
+            raise ValueError(
+                "min_class_weight cannot be greater than max_class_weight"
+            )
+        self.min_class_weight = min_class_weight
+        self.max_class_weight = max_class_weight
+
+    def forward(self, outputs: torch.Tensor, targets: torch.Tensor):
+        target_indices = self._target_to_indices(targets)
+        voxel_losses = F.cross_entropy(
+            outputs,
+            target_indices,
+            ignore_index=self.ignore_index,
+            reduction="none",
+            **self.kwargs,
+        )
+
+        patch_losses = []
+        num_classes = outputs.shape[1]
+        for patch_index in range(outputs.shape[0]):
+            patch_targets = target_indices[patch_index]
+            valid = patch_targets != self.ignore_index
+            valid_count = valid.sum()
+            if valid_count == 0:
+                patch_losses.append(outputs[patch_index].sum() * 0.0)
+                continue
+
+            class_counts = torch.bincount(
+                patch_targets[valid],
+                minlength=num_classes,
+            ).to(device=outputs.device, dtype=outputs.dtype)
+            active = class_counts > 0
+            active_count = active.sum().to(dtype=outputs.dtype)
+
+            class_weights = torch.zeros_like(class_counts)
+            class_weights[active] = valid_count.to(outputs.dtype) / (
+                active_count * class_counts[active]
+            )
+            if self.min_class_weight is not None:
+                class_weights[active] = class_weights[active].clamp(
+                    min=self.min_class_weight
+                )
+            if self.max_class_weight is not None:
+                class_weights[active] = class_weights[active].clamp(
+                    max=self.max_class_weight
+                )
+
+            voxel_weights = class_weights[patch_targets[valid]]
+            weighted_loss = voxel_losses[patch_index][valid] * voxel_weights
+            patch_losses.append(weighted_loss.sum() / voxel_weights.sum())
+
+        return torch.stack(patch_losses).mean()
+
+
+class CellMapForegroundCEBackgroundRejectionLoss(torch.nn.Module):
+    """Foreground CE with confidence rejection on a separate background mask.
+
+    The model predicts ``C`` foreground classes while the target contains
+    ``C + 1`` channels. The final target channel is a background mask:
+
+    - foreground voxels use ordinary multi-class cross-entropy;
+    - background voxels do not enter CE;
+    - background voxels are penalized when the largest foreground softmax
+      probability exceeds ``confidence_threshold``.
+    """
+
+    def __init__(
+        self,
+        confidence_threshold: float = 0.5,
+        background_penalty_weight: float = 1.0,
+        penalty_power: float = 2.0,
+        **kwargs,
+    ):
+        super().__init__()
+        if not 0.0 < confidence_threshold < 1.0:
+            raise ValueError("confidence_threshold must be between 0 and 1")
+        if background_penalty_weight < 0.0:
+            raise ValueError("background_penalty_weight must be non-negative")
+        if penalty_power <= 0.0:
+            raise ValueError("penalty_power must be positive")
+
+        self.confidence_threshold = confidence_threshold
+        self.background_penalty_weight = background_penalty_weight
+        self.penalty_power = penalty_power
+        self.ce_kwargs = kwargs
+
+    def forward(self, outputs: torch.Tensor, targets: torch.Tensor):
+        num_foreground_classes = outputs.shape[1]
+        expected_target_channels = num_foreground_classes + 1
+        if targets.shape[1] != expected_target_channels:
+            raise ValueError(
+                "Background-rejection loss expects one target channel per "
+                f"foreground class plus one bg channel: expected "
+                f"{expected_target_channels}, got {targets.shape[1]}."
+            )
+
+        foreground_targets = targets[:, :num_foreground_classes].nan_to_num(0)
+        background_mask = targets[:, -1].nan_to_num(0) > 0.5
+        foreground_mask = foreground_targets.sum(dim=1) > 0.5
+
+        target_indices = foreground_targets.argmax(dim=1)
+        if foreground_mask.any():
+            voxel_ce = F.cross_entropy(
+                outputs,
+                target_indices,
+                reduction="none",
+                **self.ce_kwargs,
+            )
+            foreground_ce = voxel_ce[foreground_mask].mean()
+        else:
+            foreground_ce = outputs.sum() * 0.0
+
+        if background_mask.any() and self.background_penalty_weight > 0.0:
+            max_foreground_probability = F.softmax(outputs, dim=1).amax(dim=1)
+            excess_confidence = F.relu(
+                max_foreground_probability - self.confidence_threshold
+            )
+            background_penalty = (
+                excess_confidence[background_mask].pow(self.penalty_power).mean()
+            )
+        else:
+            background_penalty = outputs.sum() * 0.0
+
+        return (
+            foreground_ce
+            + self.background_penalty_weight * background_penalty
+        )
+
+
 class CellMapDiceCELoss(CellMapCrossEntropyLoss):
     """Combined Dice + CE loss for mutually exclusive CellMap labels."""
 

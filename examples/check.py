@@ -34,8 +34,8 @@ RAW_DATA = (
     / "em"
     / "fibsem-uint8"
 )
-CLASSES = ["endo_lum", "cyto", "endo_mem", "bg"]
-COLORS = ["#39a9db", "#50c878", "#f06a6a", "#5b4b9a"]
+CLASSES = ["endo_lum", "cyto", "endo_mem", "pm", "ecs"]
+COLORS = ["#39a9db", "#50c878", "#f06a6a", "#f2c14e", "#2a9d8f"]
 
 
 def set_pixel_ticks(ax, image: np.ndarray, step: int = 25) -> None:
@@ -134,9 +134,12 @@ def print_stats(logits: np.ndarray, classes: list[str]) -> np.ndarray:
         arr = logits[i]
         count = int(((pred == i) & valid).sum())
         percent = 100.0 * count / max(1, int(valid.sum()))
+        positive = int((arr >= 0).sum())
+        positive_percent = 100.0 * positive / arr.size
         print(
             f"{cls:>8}: min={arr.min(): .4f}, max={arr.max(): .4f}, "
-            f"mean={arr.mean(): .4f}, argmax={count:,} ({percent:.2f}%)"
+            f"mean={arr.mean(): .4f}, sigmoid>=0.5={positive:,} "
+            f"({positive_percent:.2f}%), dominant={count:,} ({percent:.2f}%)"
         )
     return pred
 
@@ -150,8 +153,14 @@ def print_groundtruth_stats(labels: np.ndarray, classes: list[str]) -> np.ndarra
     print()
     print(f"Groundtruth path: {GT_CROP}")
     print(f"Groundtruth shape: {labels.shape} = [classes, z, y, x]")
-    print(f"Unlabeled voxels among these four classes: {unlabeled.sum():,} / {unlabeled.size:,}")
-    print(f"Overlapping voxels among these four classes: {overlap.sum():,} / {overlap.size:,}")
+    print(
+        f"Unlabeled voxels among these {len(classes)} classes: "
+        f"{unlabeled.sum():,} / {unlabeled.size:,}"
+    )
+    print(
+        f"Overlapping voxels among these {len(classes)} classes: "
+        f"{overlap.sum():,} / {overlap.size:,}"
+    )
     print()
 
     total = labels.shape[1] * labels.shape[2] * labels.shape[3]
@@ -192,7 +201,12 @@ def plot_argmax_slices(
 def plot_logit_slices(logits: np.ndarray, out_path: Path) -> None:
     z_mid = logits.shape[1] // 2
 
-    fig, axes = plt.subplots(1, len(CLASSES), figsize=(18, 4), constrained_layout=True)
+    fig, axes = plt.subplots(
+        1,
+        len(CLASSES),
+        figsize=(4.5 * len(CLASSES), 4),
+        constrained_layout=True,
+    )
     for i, (ax, cls) in enumerate(zip(axes, CLASSES)):
         image = logits[i, z_mid, :, :]
         im = ax.imshow(image, cmap="coolwarm")
@@ -212,7 +226,6 @@ def plot_raw_overlay(raw_crop: np.ndarray, pred: np.ndarray, out_path: Path) -> 
 
     cmap = ListedColormap(COLORS)
     overlay_alpha = np.full(pred_slice.shape, 0.38, dtype=np.float32)
-    overlay_alpha[pred_slice == CLASSES.index("bg")] = 0.24
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5), constrained_layout=True)
     axes[0].imshow(raw_slice, cmap="gray")
@@ -249,7 +262,6 @@ def plot_groundtruth_overlay(raw_crop: np.ndarray, gt: np.ndarray, out_path: Pat
 
     cmap = ListedColormap(COLORS)
     overlay_alpha = np.full(gt_slice.shape, 0.38, dtype=np.float32)
-    overlay_alpha[gt_slice == CLASSES.index("bg")] = 0.24
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5), constrained_layout=True)
     axes[0].imshow(raw_slice, cmap="gray")

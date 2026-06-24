@@ -183,6 +183,39 @@ def _select_prediction_batch_item(
     return item
 
 
+def _append_rejection_background(
+    outputs: dict[str, Any],
+    threshold: float,
+    background_class: str,
+) -> dict[str, Any]:
+    """Append a synthetic bg logit implementing max-softmax rejection."""
+    log_threshold = float(np.log(threshold))
+    with_background = {}
+    for array_name, class_outputs in outputs.items():
+        if isinstance(class_outputs, dict):
+            values = list(class_outputs.values())
+            foreground_logits = (
+                torch.cat(values, dim=1)
+                if values[0].ndim > 1 and values[0].shape[1] == 1
+                else torch.stack(values, dim=1)
+            )
+            background_logit = torch.logsumexp(
+                foreground_logits, dim=1, keepdim=True
+            ) + log_threshold
+            with_background[array_name] = {
+                **class_outputs,
+                background_class: background_logit,
+            }
+        else:
+            background_logit = torch.logsumexp(
+                class_outputs, dim=1, keepdim=True
+            ) + log_threshold
+            with_background[array_name] = torch.cat(
+                [class_outputs, background_logit], dim=1
+            )
+    return with_background
+
+
 def _get_owned_prediction_tiles(
     dataset_writer: CellMapDatasetWriter,
 ) -> list[dict[str, Any]]:
@@ -446,9 +479,15 @@ def _predict(
     model_classes = dataset_writer_kwargs.get(
         "model_classes", dataset_writer_kwargs["classes"]
     )
-    # Restrict classes_to_save to only those the model knows about
+    background_class = dataset_writer_kwargs.get("background_class")
+    background_threshold = dataset_writer_kwargs.get("background_threshold")
+    output_classes = list(model_classes)
+    if background_class is not None and background_threshold is not None:
+        output_classes.append(background_class)
+
+    # Restrict classes_to_save to model outputs plus the optional rejection bg.
     classes_to_save = [
-        c for c in dataset_writer_kwargs["classes"] if c in model_classes
+        c for c in dataset_writer_kwargs["classes"] if c in output_classes
     ]
     dataset_writer_kwargs["classes"] = classes_to_save
 
@@ -459,8 +498,8 @@ def _predict(
 
     # Create a mapping from class names to indices for efficient lookup during filtering
     model_class_to_index = (
-        {c: i for i, c in enumerate(model_classes)}
-        if model_classes != classes_to_save
+        {c: i for i, c in enumerate(output_classes)}
+        if output_classes != classes_to_save
         else None
     )
 
@@ -532,7 +571,9 @@ def _predict(
         )
 
     dataset_writer_kwargs = {
-        k: v for k, v in dataset_writer_kwargs.items() if k != "model_classes"
+        k: v
+        for k, v in dataset_writer_kwargs.items()
+        if k not in {"model_classes", "background_class", "background_threshold"}
     }
     dataset_writer = CellMapDatasetWriter(**dataset_writer_kwargs)
     owned_tiles = _get_owned_prediction_tiles(dataset_writer)
@@ -563,6 +604,12 @@ def _predict(
                 model_classes,
                 num_channels_per_class,
             )
+            if background_class is not None and background_threshold is not None:
+                outputs = _append_rejection_background(
+                    outputs,
+                    background_threshold,
+                    background_class,
+                )
 
             # Filter outputs to only include the classes that should be saved
             if model_class_to_index is not None:
@@ -663,7 +710,7 @@ def predict(
     search_path: str = SEARCH_PATH,
     raw_name: str = RAW_NAME,
     crop_name: str = CROP_NAME,
-    filter_classes: bool = True,
+    filter_classes: bool | None = None,
 ):
     """
     Given a model configuration file and list of crop numbers, predicts the output of a model on a large dataset by splitting it into blocks and predicting each block separately.
@@ -689,10 +736,11 @@ def predict(
         The name of the raw dataset. Default is RAW_NAME set in `cellmap-segmentation/config.py`.
     crop_name: str, optional
         The name of the crop dataset with placeholders for crop and label. Default is CROP_NAME set in `cellmap-segmentation/config.py`.
-    filter_classes: bool, optional
+    filter_classes: bool or None, optional
         When True and crops are specified by numeric ID, filter the saved classes to only those
         listed in the test_crop_manifest for each crop (intersected with the model's classes).
-        When False, all model classes are saved for numeric crops. Default is True.
+        When False, all model classes are saved for numeric crops. When None, use
+        ``predict_filter_classes`` from the configuration file, defaulting to True.
 
     Notes
     -----
@@ -703,6 +751,26 @@ def predict(
     """
     config = load_safe_config(config_path)
     classes = config.classes
+    background_class = getattr(config, "prediction_background_class", None)
+    background_threshold = getattr(
+        config, "prediction_background_threshold", None
+    )
+    if not isinstance(background_class, str) or not isinstance(
+        background_threshold, (int, float)
+    ):
+        background_class = None
+        background_threshold = None
+    prediction_classes = list(classes)
+    if background_class is not None and background_threshold is not None:
+        if not 0.0 < background_threshold < 1.0:
+            raise ValueError("prediction_background_threshold must be between 0 and 1")
+        if background_class in prediction_classes:
+            raise ValueError(
+                "prediction_background_class must not already be a model output class"
+            )
+        prediction_classes.append(background_class)
+    if filter_classes is None:
+        filter_classes = getattr(config, "predict_filter_classes", True)
     batch_size = getattr(config, "batch_size", 8)
     input_array_info = getattr(
         config, "input_array_info", {"shape": (1, 128, 128), "scale": (8, 8, 8)}
@@ -788,7 +856,7 @@ def predict(
             # Get the labels that should be scored for this specific crop from the test_crop_manifest
             crop_labels = get_test_crop_labels(crop.id)
             # Filter to only include labels that are in the model's classes
-            filtered_classes = [c for c in classes if c in crop_labels]
+            filtered_classes = [c for c in prediction_classes if c in crop_labels]
 
             # If there are no matching labels between the model and this crop, skip it
             if not filtered_classes:
@@ -810,6 +878,8 @@ def predict(
                     ),
                     "classes": filtered_classes,
                     "model_classes": classes,  # All classes the model was trained on
+                    "background_class": background_class,
+                    "background_threshold": background_threshold,
                     "input_arrays": input_arrays,
                     "target_arrays": target_arrays,
                     "target_bounds": target_bounds,
@@ -842,13 +912,15 @@ def predict(
             # Optionally filter classes using the test_crop_manifest.
             # Only applies when the crop ID is numeric AND appears in the
             # test manifest; non-test crops always save all model classes.
-            filtered_classes = classes
+            filtered_classes = prediction_classes
             if filter_classes:
                 crop_id_str = crop.replace("crop", "")
                 if crop_id_str.isnumeric():
                     crop_labels = get_test_crop_labels(int(crop_id_str))
                     if crop_labels:
-                        filtered_classes = [c for c in classes if c in crop_labels]
+                        filtered_classes = [
+                            c for c in prediction_classes if c in crop_labels
+                        ]
                         if not filtered_classes:
                             tqdm.write(
                                 f"Skipping {crop} because there are no labels in common "
@@ -865,7 +937,7 @@ def predict(
                 # or missing for a crop.
                 target_bounds = _get_crop_target_bounds(
                     crop_path,
-                    classes,
+                    prediction_classes,
                     target_arrays,
                 )
 
@@ -884,9 +956,10 @@ def predict(
                     "overwrite": overwrite,
                     "device": device,
                     "raw_value_transforms": value_transforms,
+                    "model_classes": classes,
+                    "background_class": background_class,
+                    "background_threshold": background_threshold,
                 }
-                if filtered_classes != classes:
-                    writer_kwargs["model_classes"] = classes
                 dataset_writers.append(writer_kwargs)
 
     for dataset_writer_kwargs in dataset_writers:

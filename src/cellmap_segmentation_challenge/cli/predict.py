@@ -71,6 +71,14 @@ from cellmap_segmentation_challenge.config import (
     default=CROP_NAME,
     help=f"The name of the crop dataset with placeholders for crop and label. Default is {CROP_NAME}",
 )
+@click.option(
+    "--filter-classes/--all-model-classes",
+    default=None,
+    help=(
+        "For numeric crops, filter outputs using the official test manifest or save "
+        "all model classes. If omitted, use predict_filter_classes from the config."
+    ),
+)
 def predict_cli(
     config_path,
     crops,
@@ -80,6 +88,7 @@ def predict_cli(
     search_path,
     raw_name,
     crop_name,
+    filter_classes=None,
 ):
     """
     Predict the output of a model on a large dataset by splitting it into blocks and predicting each block separately.
@@ -97,4 +106,5 @@ def predict_cli(
         search_path=search_path,
         raw_name=raw_name,
         crop_name=crop_name,
+        filter_classes=filter_classes,
     )

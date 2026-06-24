@@ -62,7 +62,10 @@ def train(config_path: str):
         - use_s3: Whether to use the S3 bucket for the datasplit. Default is False.
         - optimizer: PyTorch optimizer to use for training. Default is `torch.optim.RAdam(model.parameters(), lr=learning_rate, decoupled_weight_decay=True)`.
         - criterion: Uninstantiated PyTorch loss function to use for training. Default is `torch.nn.BCEWithLogitsLoss`.
-        - criterion_kwargs: Dictionary of keyword arguments to pass to the loss function constructor. Default is {}.
+        - criterion_kwargs: Dictionary of keyword arguments to pass to the training loss constructor. Default is {}.
+        - validation_criterion: Optional loss function used only for validation. If omitted, validation uses the instantiated training criterion for backward compatibility.
+        - validation_criterion_kwargs: Dictionary of keyword arguments passed to `validation_criterion`. Default is {}.
+        - validation_wrap_loss: Whether to wrap `validation_criterion` with `CellMapLossWrapper`. Default is the value of `wrap_loss`.
         - weight_loss: Whether to weight the loss function by class counts found in the datasets. Default is True.
         - use_mutual_exclusion: Whether to use mutual exclusion to infer labels for unannotated pixels. Default is False.
         - weighted_sampler: Whether to use a sampler weighted by class counts for the dataloader. Default is True.
@@ -112,6 +115,12 @@ def train(config_path: str):
             _clone_tensors(targets),
         )
 
+    def _foreground_targets_for_viz(target_data):
+        """Drop auxiliary target channels that the model does not predict."""
+        if torch.is_tensor(target_data) and target_data.ndim >= 2:
+            return target_data[:, : len(classes)]
+        return target_data
+
     # %% Load the configuration file
     config = load_safe_config(config_path)
     # %% Set hyperparameters and other configurations from the config file
@@ -144,6 +153,7 @@ def train(config_path: str):
     iterations_per_epoch = getattr(config, "iterations_per_epoch", 1000)
     random_seed = getattr(config, "random_seed", getattr(os.environ, "SEED", 42))
     classes = getattr(config, "classes", ["nuc", "er"])
+    target_classes = getattr(config, "target_classes", classes)
     model_name = getattr(config, "model_name", "2d_unet")
     model_to_load = getattr(config, "model_to_load", model_name)
     model_kwargs = getattr(config, "model_kwargs", {})
@@ -209,9 +219,14 @@ def train(config_path: str):
 
     # %% Define the loss function, from the config file or default to BCEWithLogitsLoss
     criterion = getattr(config, "criterion", torch.nn.BCEWithLogitsLoss)
-    criterion_kwargs = getattr(config, "criterion_kwargs", {})
+    criterion_kwargs = dict(getattr(config, "criterion_kwargs", {}))
     weight_loss = getattr(config, "weight_loss", True)
     wrap_loss = getattr(config, "wrap_loss", True)
+    configured_validation_criterion = getattr(config, "validation_criterion", None)
+    validation_criterion_kwargs = dict(
+        getattr(config, "validation_criterion_kwargs", {})
+    )
+    validation_wrap_loss = getattr(config, "validation_wrap_loss", wrap_loss)
 
     gradient_accumulation_steps = getattr(
         config, "gradient_accumulation_steps", 1
@@ -267,7 +282,7 @@ def train(config_path: str):
         # Make the datasplit CSV
         if use_s3:
             make_s3_datasplit_csv(
-                classes=classes,
+                classes=target_classes,
                 scale=scale,
                 csv_path=datasplit_path,
                 validation_prob=validation_prob,
@@ -275,7 +290,7 @@ def train(config_path: str):
             )
         else:
             make_datasplit_csv(
-                classes=classes,
+                classes=target_classes,
                 scale=scale,
                 csv_path=datasplit_path,
                 validation_prob=validation_prob,
@@ -285,7 +300,7 @@ def train(config_path: str):
     # %% Download the data and make the dataloader
     train_loader, val_loader = get_dataloader(
         datasplit_path=datasplit_path,
-        classes=classes,
+        classes=target_classes,
         batch_size=batch_size,
         input_array_info=input_array_info,
         target_array_info=target_array_info,
@@ -364,9 +379,25 @@ def train(config_path: str):
             pos_weight = pos_weight[..., None]
         criterion_kwargs["pos_weight"] = pos_weight
     if wrap_loss:
-        criterion = CellMapLossWrapper(criterion, **criterion_kwargs)
+        train_criterion = CellMapLossWrapper(criterion, **criterion_kwargs)
     elif isinstance(criterion, type):
-        criterion = criterion(**criterion_kwargs)
+        train_criterion = criterion(**criterion_kwargs)
+    else:
+        train_criterion = criterion
+
+    if configured_validation_criterion is None:
+        validation_criterion = train_criterion
+    elif validation_wrap_loss:
+        validation_criterion = CellMapLossWrapper(
+            configured_validation_criterion,
+            **validation_criterion_kwargs,
+        )
+    elif isinstance(configured_validation_criterion, type):
+        validation_criterion = configured_validation_criterion(
+            **validation_criterion_kwargs
+        )
+    else:
+        validation_criterion = configured_validation_criterion
 
     input_keys = list(train_loader.dataset.input_arrays.keys())
     target_keys = list(train_loader.dataset.target_arrays.keys())
@@ -436,7 +467,7 @@ def train(config_path: str):
             if outputs.ndim == 5 and targets.ndim == 4 and outputs.shape[2] == 1:
                 outputs = outputs.squeeze(2)
 
-            loss = criterion(outputs, targets) / gradient_accumulation_steps
+            loss = train_criterion(outputs, targets) / gradient_accumulation_steps
 
             # Backward pass (compute the gradients)
             loss.backward()
@@ -545,7 +576,7 @@ def train(config_path: str):
                     if outputs.ndim == 5 and targets.ndim == 4 and outputs.shape[2] == 1:
                         outputs = outputs.squeeze(2)
 
-                    val_score += criterion(outputs, targets).item()
+                    val_score += validation_criterion(outputs, targets).item()
                     i += 1
 
                     # Check time limit
@@ -602,7 +633,7 @@ def train(config_path: str):
                 for i, (in_key, target_key) in enumerate(zip(input_keys, target_keys)):
                     figs = get_fig_dict(
                         input_data=batch[in_key],
-                        target_data=batch[target_key],
+                        target_data=_foreground_targets_for_viz(batch[target_key]),
                         outputs=outputs[i],
                         classes=classes,
                     )
@@ -624,7 +655,12 @@ def train(config_path: str):
                     targets = list(targets.values())[0]
                 elif isinstance(targets, list):
                     targets = targets[0]
-                figs = get_fig_dict(inputs, targets, outputs, classes)
+                figs = get_fig_dict(
+                    inputs,
+                    _foreground_targets_for_viz(targets),
+                    outputs,
+                    classes,
+                )
                 for name, fig in figs.items():
                     writer.add_figure(name, fig, n_iter)
                     writer.flush()  # Ensure figures are written to disk
