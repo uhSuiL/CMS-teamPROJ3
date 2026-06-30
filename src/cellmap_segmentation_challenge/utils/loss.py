@@ -302,6 +302,155 @@ class CellMapDiceCELoss(CellMapCrossEntropyLoss):
         return self.ce_weight * ce_loss + self.dice_weight * dice_loss
 
 
+class CellMapFilteredDynamicWeightedDiceCELoss(CellMapCrossEntropyLoss):
+    """Patch-filtered dynamic inverse-frequency CE + Dice loss.
+
+    This loss is for mutually exclusive CellMap labels stored as one binary
+    channel per class. It can ignore whole patches when selected classes occupy
+    too much of the patch, then trains on the remaining patches with:
+
+    ``ce_weight * dynamic_inverse_frequency_CE + dice_weight * Dice``.
+    """
+
+    def __init__(
+        self,
+        ce_weight: float = 0.4,
+        dice_weight: float = 0.6,
+        dice_smooth: float = 1.0,
+        min_class_weight: float | None = None,
+        max_class_weight: float | None = 100.0,
+        filter_class_indices: list[int] | tuple[int, ...] | None = None,
+        filter_ratio_threshold: float | None = None,
+        include_background: bool = True,
+        ignore_index: int = -100,
+        **kwargs,
+    ):
+        super().__init__(ignore_index=ignore_index, **kwargs)
+        if ce_weight < 0 or dice_weight < 0:
+            raise ValueError("ce_weight and dice_weight must be non-negative")
+        if min_class_weight is not None and min_class_weight <= 0:
+            raise ValueError("min_class_weight must be positive or None")
+        if max_class_weight is not None and max_class_weight <= 0:
+            raise ValueError("max_class_weight must be positive or None")
+        if (
+            min_class_weight is not None
+            and max_class_weight is not None
+            and min_class_weight > max_class_weight
+        ):
+            raise ValueError(
+                "min_class_weight cannot be greater than max_class_weight"
+            )
+        if filter_ratio_threshold is not None and not 0 <= filter_ratio_threshold <= 1:
+            raise ValueError("filter_ratio_threshold must be between 0 and 1")
+
+        self.ce_weight = ce_weight
+        self.dice_weight = dice_weight
+        self.dice_smooth = dice_smooth
+        self.min_class_weight = min_class_weight
+        self.max_class_weight = max_class_weight
+        self.filter_class_indices = (
+            None if filter_class_indices is None else tuple(filter_class_indices)
+        )
+        self.filter_ratio_threshold = filter_ratio_threshold
+        self.include_background = include_background
+
+    def _patch_is_kept(self, patch_targets: torch.Tensor, valid: torch.Tensor) -> bool:
+        if self.filter_class_indices is None or self.filter_ratio_threshold is None:
+            return True
+
+        valid_count = valid.sum()
+        if valid_count == 0:
+            return False
+
+        filter_mask = torch.zeros_like(valid)
+        for class_index in self.filter_class_indices:
+            filter_mask |= patch_targets == class_index
+        filter_ratio = (filter_mask & valid).sum().to(torch.float32) / valid_count
+        return bool(filter_ratio <= self.filter_ratio_threshold)
+
+    def forward(self, outputs: torch.Tensor, targets: torch.Tensor):
+        target_indices = self._target_to_indices(targets)
+        voxel_losses = F.cross_entropy(
+            outputs,
+            target_indices,
+            ignore_index=self.ignore_index,
+            reduction="none",
+            **self.kwargs,
+        )
+        probabilities = F.softmax(outputs, dim=1)
+        num_classes = outputs.shape[1]
+
+        patch_losses = []
+        for patch_index in range(outputs.shape[0]):
+            patch_targets = target_indices[patch_index]
+            valid = patch_targets != self.ignore_index
+            if not self._patch_is_kept(patch_targets, valid):
+                continue
+
+            valid_count = valid.sum()
+            if valid_count == 0:
+                continue
+
+            class_counts = torch.bincount(
+                patch_targets[valid],
+                minlength=num_classes,
+            ).to(device=outputs.device, dtype=outputs.dtype)
+            active = class_counts > 0
+            active_count = active.sum().to(dtype=outputs.dtype)
+
+            class_weights = torch.zeros_like(class_counts)
+            class_weights[active] = valid_count.to(outputs.dtype) / (
+                active_count * class_counts[active]
+            )
+            if self.min_class_weight is not None:
+                class_weights[active] = class_weights[active].clamp(
+                    min=self.min_class_weight
+                )
+            if self.max_class_weight is not None:
+                class_weights[active] = class_weights[active].clamp(
+                    max=self.max_class_weight
+                )
+            active_weight_mean = class_weights[active].mean()
+            if active_weight_mean > 0:
+                class_weights[active] = class_weights[active] / active_weight_mean
+
+            voxel_weights = class_weights[patch_targets[valid]]
+            ce_loss = (
+                voxel_losses[patch_index][valid] * voxel_weights
+            ).sum() / voxel_weights.sum()
+
+            safe_target = patch_targets.masked_fill(valid.logical_not(), 0)
+            target_one_hot = F.one_hot(
+                safe_target,
+                num_classes=num_classes,
+            ).movedim(-1, 0)
+            target_one_hot = target_one_hot.to(dtype=outputs.dtype)
+            patch_probs = probabilities[patch_index]
+            valid_for_dice = valid.unsqueeze(0)
+            patch_probs = patch_probs * valid_for_dice
+            target_one_hot = target_one_hot * valid_for_dice
+
+            if not self.include_background and num_classes > 1:
+                patch_probs = patch_probs[:-1]
+                target_one_hot = target_one_hot[:-1]
+
+            reduce_dims = tuple(range(1, patch_probs.ndim))
+            intersection = (patch_probs * target_one_hot).sum(dim=reduce_dims)
+            denominator = patch_probs.sum(dim=reduce_dims) + target_one_hot.sum(
+                dim=reduce_dims
+            )
+            dice_score = (2 * intersection + self.dice_smooth) / (
+                denominator + self.dice_smooth
+            )
+            dice_loss = 1 - dice_score.mean()
+
+            patch_losses.append(self.ce_weight * ce_loss + self.dice_weight * dice_loss)
+
+        if not patch_losses:
+            return outputs.sum() * 0.0
+        return torch.stack(patch_losses).mean()
+
+
 class CellMapFocalDiceLoss(CellMapCrossEntropyLoss):
     """Combined focal + Dice loss for imbalanced mutually exclusive labels."""
 

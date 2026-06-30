@@ -30,10 +30,14 @@ from cellmap_segmentation_challenge.models import (
     ViTVNet,
 )
 from cellmap_segmentation_challenge.utils import get_tested_classes
+from cellmap_segmentation_challenge.utils.loss import (
+    CellMapCrossEntropyLoss,
+    CellMapFilteredDynamicWeightedDiceCELoss,
+)
 
 # %% Set hyperparameters and other configurations
-learning_rate = 0.0002  # learning rate for the optimizer
-batch_size = 2  # batch size for the dataloader
+learning_rate = 0.00005  # learning rate for the optimizer
+batch_size = 16  # final valid batch size after patch filtering
 input_array_info = {
     "shape": (128, 128, 128),
     "scale": (8, 8, 8),
@@ -42,30 +46,42 @@ target_array_info = {
     "shape": (128, 128, 128),
     "scale": (8, 8, 8),
 }  # shape and voxel size of the data to load for the target
-epochs = 150  # number of epochs to train the model for
-iterations_per_epoch = 3  # number of iterations per epoch
+epochs = 200  # number of epochs to train the model for
+iterations_per_epoch = 15  # 150 epochs * 120 iterations ~= a long supercomputer run
 random_seed = 42  # random seed for reproducibility
 
 # classes = ["nuc", "er"]  # list of classes to segment
 # classes = get_tested_classes()  # list of classes to segment
-classes = ["endo_lum", "cyto", "endo_mem", "pm", "ecs"]
+classes = ["endo_lum", "cyto", "endo_mem", "pm", "ecs", "bg"]
 target_classes = classes
 force_all_classes = True
-# Save all five model classes for explicitly requested numeric crops.
+# Save all six model classes for explicitly requested numeric crops.
 predict_filter_classes = False
 
-# Explicit BCE configuration.
-# Training uses the original CellMap behavior: class-frequency pos_weight is
-# added automatically, then CellMapLossWrapper ignores NaN target voxels.
-criterion = torch.nn.BCEWithLogitsLoss
-criterion_kwargs = {}
-wrap_loss = True
-weight_loss = True
+# Formal six-class experiment:
+# 0.4 dynamic inverse-frequency CE + 0.6 Dice.
+# Patches where ecs + bg occupy more than 60% are rejected before model forward.
+patch_filter_class_indices = [4, 5]  # ["ecs", "bg"]
+patch_filter_ratio_threshold = 0.65
+patch_filter_max_attempts = 200
+patch_filter_min_batch_size = 16
 
-# Validation also uses BCE, without training-set class weighting.
-validation_criterion = torch.nn.BCEWithLogitsLoss
+criterion = CellMapFilteredDynamicWeightedDiceCELoss
+criterion_kwargs = {
+    "ce_weight": 0.5,
+    "dice_weight": 0.5,
+    "dice_smooth": 0.05,
+    "min_class_weight": 0.1,
+    "max_class_weight": 10.0,
+    "include_background": True,
+}
+wrap_loss = False
+weight_loss = False
+
+# Validation uses plain multi-class CE as a simple unweighted metric.
+validation_criterion = CellMapCrossEntropyLoss
 validation_criterion_kwargs = {}
-validation_wrap_loss = True
+validation_wrap_loss = False
 
 # # Defining model (comment out all that are not used)
 # # 3D UNet
@@ -74,14 +90,14 @@ validation_wrap_loss = True
 # model = UNet_3D(1, len(classes))
 
 # 3D ResNet
-# model_name = "3d_resnet_6class"
-# model_to_load = "3d_resnet_6class"
-# model = ResNet(ndims=3, output_nc=len(classes))
+model_name = "3d_resnet_6class"
+model_to_load = "3d_resnet_6class"
+model = ResNet(ndims=3, output_nc=len(classes))
 
 # # 3D TransUNet
-model_name = "3d_transunet_6class"
-model_to_load = "3d_transunet_6class"
-model = TransUNet_3D(1, len(classes), img_size=input_array_info["shape"])
+# model_name = "3d_transunet_6class"
+# model_to_load = "3d_transunet_6class"
+# model = TransUNet_3D(1, len(classes), img_size=input_array_info["shape"])
 
 # 3D SegFormer
 # model_name = "3d_segformer_6class"
@@ -112,7 +128,7 @@ spatial_transforms = {  # dictionary of spatial transformations to apply to the 
 }
 
 # Set a limit to how long the validation can take
-validation_time_limit = 25  # time limit in seconds for the validation step
+validation_time_limit = 30  # time limit in seconds for the validation step
 filter_by_scale = True  # filter the data by scale
 
 if __name__ == "__main__":

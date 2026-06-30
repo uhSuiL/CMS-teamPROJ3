@@ -8,34 +8,37 @@ from matplotlib.colors import ListedColormap
 from matplotlib.patches import Patch
 
 
+CROP_ID = "crop139"
+DATASET = "jrc_mus-liver"
+
 PRED_CROP = (
     Path(__file__).resolve().parents[1]
     / "data"
     / "predictions"
-    / "jrc_mus-liver.zarr"
-    / "crop124"
+    / f"{DATASET}.zarr"
+    / CROP_ID
 )
 GT_CROP = (
     Path(__file__).resolve().parents[1]
     / "data"
-    / "jrc_mus-liver"
-    / "jrc_mus-liver.zarr"
+    / DATASET
+    / f"{DATASET}.zarr"
     / "recon-1"
     / "labels"
     / "groundtruth"
-    / "crop124"
+    / CROP_ID
 )
 RAW_DATA = (
     Path(__file__).resolve().parents[1]
     / "data"
-    / "jrc_mus-liver"
-    / "jrc_mus-liver.zarr"
+    / DATASET
+    / f"{DATASET}.zarr"
     / "recon-1"
     / "em"
     / "fibsem-uint8"
 )
-CLASSES = ["endo_lum", "cyto", "endo_mem", "pm", "ecs"]
-COLORS = ["#39a9db", "#50c878", "#f06a6a", "#f2c14e", "#2a9d8f"]
+CLASSES = ["endo_lum", "cyto", "endo_mem", "pm", "ecs", 'bg']
+COLORS = ["#39a9db", "#50c878", "#f06a6a", "#f2c14e", "#2a9d8f", "#5e4fa2"]
 
 
 def set_pixel_ticks(ax, image: np.ndarray, step: int = 25) -> None:
@@ -299,11 +302,12 @@ def main() -> None:
     raw_crop = load_raw_crop(PRED_CROP, RAW_DATA, logits.shape[1:])
 
     out_dir = Path(__file__).resolve().parent
-    argmax_path = out_dir / "check_crop124_argmax.png"
-    logits_path = out_dir / "check_crop124_logits.png"
-    overlay_path = out_dir / "check_crop124_overlay.png"
-    gt_path = out_dir / "check_crop124_groundtruth.png"
-    gt_overlay_path = out_dir / "check_crop124_gt_overlay.png"
+    output_prefix = f"check_{CROP_ID}"
+    argmax_path = out_dir / f"{output_prefix}_argmax.png"
+    logits_path = out_dir / f"{output_prefix}_logits.png"
+    overlay_path = out_dir / f"{output_prefix}_overlay.png"
+    gt_path = out_dir / f"{output_prefix}_groundtruth.png"
+    gt_overlay_path = out_dir / f"{output_prefix}_gt_overlay.png"
     plot_argmax_slices(pred, argmax_path, figure_title="Prediction argmax slices")
     plot_logit_slices(logits, logits_path)
     plot_raw_overlay(raw_crop, pred, overlay_path)

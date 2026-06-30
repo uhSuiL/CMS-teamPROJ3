@@ -115,6 +115,151 @@ def train(config_path: str):
             _clone_tensors(targets),
         )
 
+    def _take_batch_indices(data, indices):
+        """Take selected items along the batch dimension from nested tensors."""
+        if torch.is_tensor(data):
+            return data.index_select(0, indices)
+        if isinstance(data, dict):
+            return {
+                key: _take_batch_indices(value, indices)
+                for key, value in data.items()
+            }
+        if isinstance(data, (list, tuple)):
+            return type(data)(_take_batch_indices(value, indices) for value in data)
+        return data
+
+    def _concat_batch_parts(parts):
+        """Concatenate nested tensors along the batch dimension."""
+        if len(parts) == 1:
+            return parts[0]
+        first = parts[0]
+        if torch.is_tensor(first):
+            return torch.cat(parts, dim=0)
+        if isinstance(first, dict):
+            return {
+                key: _concat_batch_parts([part[key] for part in parts])
+                for key in first
+            }
+        if isinstance(first, (list, tuple)):
+            return type(first)(
+                _concat_batch_parts([part[index] for part in parts])
+                for index in range(len(first))
+            )
+        return first
+
+    def _batch_length(data):
+        if torch.is_tensor(data):
+            return data.shape[0]
+        if isinstance(data, dict):
+            return _batch_length(next(iter(data.values())))
+        if isinstance(data, (list, tuple)):
+            return _batch_length(data[0])
+        raise ValueError("Cannot infer batch length for patch filtering.")
+
+    def _target_ratio_keep_indices(targets, class_indices, threshold):
+        """Return batch indices where selected class channels stay under threshold."""
+        if isinstance(targets, dict):
+            if len(targets) != 1:
+                raise ValueError(
+                    "patch_filter currently expects a single target tensor, "
+                    f"but got {len(targets)} target arrays."
+                )
+            targets = next(iter(targets.values()))
+        if not torch.is_tensor(targets) or targets.ndim < 3:
+            raise ValueError(
+                "patch_filter expects targets with shape (B, C, ...)."
+            )
+
+        channels = targets.shape[1]
+        bad_indices = [
+            index for index in class_indices if index < 0 or index >= channels
+        ]
+        if bad_indices:
+            raise ValueError(
+                f"patch_filter_class_indices {bad_indices} are outside target "
+                f"channel range 0..{channels - 1}."
+            )
+
+        finite_targets = targets.isfinite()
+        valid_voxels = finite_targets.any(dim=1)
+        valid_counts = valid_voxels.flatten(1).sum(dim=1)
+
+        selected = targets[:, list(class_indices)].nan_to_num(0)
+        selected_voxels = selected.sum(dim=1) > 0.5
+        selected_counts = (selected_voxels & valid_voxels).flatten(1).sum(dim=1)
+
+        ratios = torch.zeros(
+            targets.shape[0],
+            device=targets.device,
+            dtype=torch.float32,
+        )
+        non_empty = valid_counts > 0
+        ratios[non_empty] = (
+            selected_counts[non_empty].float() / valid_counts[non_empty].float()
+        )
+        keep = non_empty & (ratios <= threshold)
+        return torch.where(keep)[0], ratios
+
+    def _load_batch_tensors(batch):
+        inputs = get_data_from_batch(batch, input_keys, device)
+        if singleton_dim is not None:
+            inputs = squeeze_singleton_dim(inputs, singleton_dim + 2)
+        targets = get_data_from_batch(batch, target_keys, device)
+        return inputs, targets
+
+    def _next_loader_batch(loader_iter):
+        try:
+            return next(loader_iter), loader_iter
+        except StopIteration:
+            loader_iter = iter(train_loader.loader)
+            return next(loader_iter), loader_iter
+
+    def _collect_filtered_training_batch(loader_iter):
+        """Collect valid patches before model forward according to config."""
+        input_parts = []
+        target_parts = []
+        raw_batch_for_viz = None
+        valid_count = 0
+        attempts = 0
+        rejected_count = 0
+
+        while valid_count < batch_size and attempts < patch_filter_max_attempts:
+            raw_batch, loader_iter = _next_loader_batch(loader_iter)
+            attempts += 1
+            inputs, targets = _load_batch_tensors(raw_batch)
+            keep_indices, _ = _target_ratio_keep_indices(
+                targets,
+                patch_filter_class_indices,
+                patch_filter_ratio_threshold,
+            )
+            rejected_count += int(_batch_length(targets) - keep_indices.numel())
+
+            if keep_indices.numel() > 0:
+                need = batch_size - valid_count
+                keep_indices = keep_indices[:need]
+                input_parts.append(_take_batch_indices(inputs, keep_indices))
+                target_parts.append(_take_batch_indices(targets, keep_indices))
+                valid_count += keep_indices.numel()
+                if raw_batch_for_viz is None:
+                    raw_batch_for_viz = raw_batch
+
+            if keep_indices.numel() == 0:
+                del inputs, targets, raw_batch
+
+        if valid_count < patch_filter_min_batch_size:
+            return None, None, None, loader_iter, attempts, rejected_count
+
+        inputs = _concat_batch_parts(input_parts)
+        targets = _concat_batch_parts(target_parts)
+        return (
+            raw_batch_for_viz,
+            inputs,
+            targets,
+            loader_iter,
+            attempts,
+            rejected_count,
+        )
+
     def _foreground_targets_for_viz(target_data):
         """Drop auxiliary target channels that the model does not predict."""
         if torch.is_tensor(target_data) and target_data.ndim >= 2:
@@ -201,6 +346,31 @@ def train(config_path: str):
     max_grad_norm = getattr(config, "max_grad_norm", None)
     force_all_classes = getattr(config, "force_all_classes", "validate")
     print("force_all_classes:", force_all_classes)
+    patch_filter_class_indices = getattr(config, "patch_filter_class_indices", None)
+    patch_filter_ratio_threshold = getattr(
+        config,
+        "patch_filter_ratio_threshold",
+        None,
+    )
+    patch_filter_max_attempts = getattr(config, "patch_filter_max_attempts", 50)
+    patch_filter_min_batch_size = getattr(config, "patch_filter_min_batch_size", 1)
+    use_patch_filter = (
+        patch_filter_class_indices is not None
+        and patch_filter_ratio_threshold is not None
+    )
+    if use_patch_filter:
+        patch_filter_class_indices = tuple(patch_filter_class_indices)
+        if not 0.0 <= patch_filter_ratio_threshold <= 1.0:
+            raise ValueError("patch_filter_ratio_threshold must be between 0 and 1")
+        if patch_filter_max_attempts < 1:
+            raise ValueError("patch_filter_max_attempts must be >= 1")
+        if patch_filter_min_batch_size < 1:
+            raise ValueError("patch_filter_min_batch_size must be >= 1")
+        print(
+            "Patch filter enabled: keeping patches with selected-class ratio "
+            f"<= {patch_filter_ratio_threshold}; class indices="
+            f"{patch_filter_class_indices}; target batch_size={batch_size}."
+        )
 
     # %% Define the optimizer, from the config file or default to RAdam
     optimizer = getattr(
@@ -442,28 +612,51 @@ def train(config_path: str):
         # Training loop for the epoch
         post_fix_dict["Epoch"] = epoch
 
+        train_iter = iter(train_loader.loader)
         epoch_bar = tqdm(
-            train_loader.loader,
+            range(iterations_per_epoch),
             desc="Training",
             dynamic_ncols=True,
             total=iterations_per_epoch,
         )
         optimizer.zero_grad()
-        for epoch_iter, batch in enumerate(epoch_bar):
+        for epoch_iter in epoch_bar:
             # Increment the training iteration
             n_iter += 1
 
+            # Collect a training batch. If configured, reject patches before
+            # forward until a full valid batch is assembled.
+            if use_patch_filter:
+                (
+                    batch,
+                    inputs,
+                    targets,
+                    train_iter,
+                    filter_attempts,
+                    rejected_count,
+                ) = _collect_filtered_training_batch(train_iter)
+                if inputs is None:
+                    post_fix_dict["Skipped"] = (
+                        f"no valid patches in {filter_attempts} attempts"
+                    )
+                    epoch_bar.set_postfix(post_fix_dict)
+                    optimizer.zero_grad()
+                    n_iter -= 1
+                    continue
+                post_fix_dict["Filter"] = (
+                    f"{_batch_length(inputs)}/{batch_size} kept, "
+                    f"{rejected_count} rejected, {filter_attempts} draws"
+                )
+            else:
+                batch, train_iter = _next_loader_batch(train_iter)
+                inputs, targets = _load_batch_tensors(batch)
+
             # Forward pass (compute the model outputs)
-            inputs = get_data_from_batch(batch, input_keys, device)
-            if singleton_dim is not None:
-                inputs = squeeze_singleton_dim(inputs, singleton_dim + 2)
             outputs = model(inputs)
             if singleton_dim is not None:
                 outputs = unsqueeze_singleton_dim(outputs, singleton_dim + 2)
 
             # Compute the loss
-            targets = get_data_from_batch(batch, target_keys, device)
-
             if outputs.ndim == 5 and targets.ndim == 4 and outputs.shape[2] == 1:
                 outputs = outputs.squeeze(2)
 
