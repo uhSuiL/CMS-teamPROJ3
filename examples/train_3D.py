@@ -70,7 +70,7 @@ criterion = CellMapFilteredDynamicWeightedDiceCELoss
 criterion_kwargs = {
     "ce_weight": 0.5,
     "dice_weight": 0.5,
-    "dice_smooth": 0.05,
+    "dice_smooth": 0.02,
     "min_class_weight": 0.1,
     "max_class_weight": 10.0,
     "include_background": True,
