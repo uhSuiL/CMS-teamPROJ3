@@ -72,25 +72,7 @@ def load_logits(crop_path: Path, classes: list[str]) -> np.ndarray:
     return np.stack(arrays, axis=0)
 
 
-def load_binary_labels(
-    crop_path: Path, classes: list[str], level_path: str = "s1"
-) -> np.ndarray:
-    arrays = []
-    for cls in classes:
-        arr_path = crop_path / cls / level_path
-        if not arr_path.exists():
-            arr_path = crop_path / cls / "s0"
-        if not arr_path.exists():
-            raise FileNotFoundError(f"Missing label array: {arr_path}")
-        arrays.append((np.asarray(zarr.open(str(arr_path), mode="r")) > 0).astype(np.uint8))
-
-    shapes = {arr.shape for arr in arrays}
-    if len(shapes) != 1:
-        raise ValueError(f"Label arrays have different shapes: {shapes}")
-    return np.stack(arrays, axis=0)
-
-
-def _read_level_transform(group_path: Path, level_path: str = "s0") -> tuple[list[float], list[float]]:
+def _read_level_transform(group_path: Path, level_path: str = "s0") -> tuple[np.ndarray, np.ndarray]:
     attrs_path = group_path / ".zattrs"
     attrs = json.loads(attrs_path.read_text())
     multiscale = attrs["multiscales"][0]
@@ -108,28 +90,160 @@ def _read_level_transform(group_path: Path, level_path: str = "s0") -> tuple[lis
         scale = [1.0, 1.0, 1.0]
     if translation is None:
         translation = [0.0, 0.0, 0.0]
-    return scale, translation
+    return np.asarray(scale, dtype=np.float64), np.asarray(translation, dtype=np.float64)
+
+
+def _level_transform_from_dataset(dataset: dict) -> tuple[np.ndarray, np.ndarray]:
+    scale = None
+    translation = None
+    for transform in dataset["coordinateTransformations"]:
+        if transform["type"] == "scale":
+            scale = transform["scale"]
+        elif transform["type"] == "translation":
+            translation = transform["translation"]
+    if scale is None:
+        scale = [1.0, 1.0, 1.0]
+    if translation is None:
+        translation = [0.0, 0.0, 0.0]
+    return np.asarray(scale, dtype=np.float64), np.asarray(translation, dtype=np.float64)
+
+
+def find_matching_gt_level(
+    gt_class_path: Path,
+    pred_scale: np.ndarray,
+    pred_translation: np.ndarray,
+) -> str:
+    attrs = json.loads((gt_class_path / ".zattrs").read_text())
+    datasets = attrs["multiscales"][0]["datasets"]
+    for dataset in datasets:
+        level_path = dataset["path"]
+        scale, _ = _level_transform_from_dataset(dataset)
+        if np.allclose(scale, pred_scale):
+            return level_path
+
+    for dataset in datasets:
+        level_path = dataset["path"]
+        scale, translation = _level_transform_from_dataset(dataset)
+        if np.allclose(scale[1:], pred_scale[1:]) and np.allclose(
+            translation, pred_translation, atol=1e-3
+        ):
+            return level_path
+
+    best_dataset = min(
+        datasets,
+        key=lambda ds: float(
+            np.linalg.norm(_level_transform_from_dataset(ds)[1] - pred_translation)
+        ),
+    )
+    return best_dataset["path"]
+
+
+def crop_gt_to_prediction_region(
+    gt_class_path: Path,
+    gt_level: str,
+    pred_shape: tuple[int, int, int],
+    pred_scale: np.ndarray,
+    pred_translation: np.ndarray,
+) -> np.ndarray:
+    gt_scale, gt_translation = _read_level_transform(gt_class_path, gt_level)
+    gt_array = zarr.open(str(gt_class_path / gt_level), mode="r")
+    start = np.rint((pred_translation - gt_translation) / gt_scale).astype(int)
+    stop = start + np.asarray(pred_shape, dtype=int)
+
+    gt_shape = np.asarray(gt_array.shape, dtype=int)
+    clipped_start = np.maximum(start, 0)
+    clipped_stop = np.minimum(stop, gt_shape)
+    if np.any(clipped_start >= clipped_stop):
+        raise ValueError(
+            f"Prediction region start={start.tolist()}, stop={stop.tolist()} has no overlap with "
+            f"GT shape {gt_array.shape} for {gt_class_path / gt_level}"
+        )
+
+    slices = tuple(slice(int(clipped_start[i]), int(clipped_stop[i])) for i in range(3))
+    label = (np.asarray(gt_array[slices]) > 0).astype(np.uint8)
+    if label.shape != pred_shape:
+        label_tensor = torch.from_numpy(label[None, None].astype(np.float32))
+        resized = torch.nn.functional.interpolate(
+            label_tensor,
+            size=pred_shape,
+            mode="nearest",
+        )
+        label = resized[0, 0].numpy().astype(np.uint8)
+    return label
+
+
+def load_binary_labels(
+    crop_path: Path,
+    classes: list[str],
+    pred_shape: tuple[int, int, int],
+    pred_scale: np.ndarray,
+    pred_translation: np.ndarray,
+) -> np.ndarray:
+    arrays = []
+    gt_level = find_matching_gt_level(crop_path / classes[0], pred_scale, pred_translation)
+    print(
+        f"GT alignment: using level {gt_level}, prediction scale={pred_scale.tolist()}, "
+        f"translation={pred_translation.tolist()}"
+    )
+    for cls in classes:
+        class_path = crop_path / cls
+        if not (class_path / gt_level).exists():
+            raise FileNotFoundError(f"Missing label array: {class_path / gt_level}")
+        arrays.append(
+            crop_gt_to_prediction_region(
+                class_path,
+                gt_level,
+                pred_shape,
+                pred_scale,
+                pred_translation,
+            )
+        )
+
+    shapes = {arr.shape for arr in arrays}
+    if len(shapes) != 1:
+        raise ValueError(f"Label arrays have different shapes: {shapes}")
+    return np.stack(arrays, axis=0)
+
+
+def crop_raw_to_prediction_region(
+    raw_path: Path,
+    raw_level: str,
+    pred_shape: tuple[int, int, int],
+    pred_translation: np.ndarray,
+) -> np.ndarray:
+    raw_scale, raw_translation = _read_level_transform(raw_path, raw_level)
+    raw_array = zarr.open(str(raw_path / raw_level), mode="r")
+    start = np.rint((pred_translation - raw_translation) / raw_scale).astype(int)
+    stop = start + np.asarray(pred_shape, dtype=int)
+
+    raw_shape = np.asarray(raw_array.shape, dtype=int)
+    clipped_start = np.maximum(start, 0)
+    clipped_stop = np.minimum(stop, raw_shape)
+    if np.any(clipped_start >= clipped_stop):
+        raise ValueError(
+            f"Prediction region start={start.tolist()}, stop={stop.tolist()} has no overlap with "
+            f"raw shape {raw_array.shape} for {raw_path / raw_level}"
+        )
+
+    slices = tuple(slice(int(clipped_start[i]), int(clipped_stop[i])) for i in range(3))
+    crop = np.asarray(raw_array[slices])
+    if crop.shape != pred_shape:
+        crop_tensor = torch.from_numpy(crop[None, None].astype(np.float32))
+        resized = torch.nn.functional.interpolate(
+            crop_tensor,
+            size=pred_shape,
+            mode="trilinear",
+            align_corners=False,
+        )
+        crop = resized[0, 0].numpy()
+    return crop
 
 
 def load_raw_crop(pred_crop_path: Path, raw_path: Path, pred_shape: tuple[int, int, int]) -> np.ndarray:
     pred_scale, pred_translation = _read_level_transform(pred_crop_path / CLASSES[0])
-    raw_scale, raw_translation = _read_level_transform(raw_path)
-
-    if not np.allclose(pred_scale, raw_scale):
-        raise ValueError(f"Prediction scale {pred_scale} does not match raw scale {raw_scale}")
-
-    start = [
-        int(round((pred_translation[i] - raw_translation[i]) / raw_scale[i]))
-        for i in range(3)
-    ]
-    stop = [start[i] + pred_shape[i] for i in range(3)]
-
-    raw = zarr.open(str(raw_path / "s0"), mode="r")
-    slices = tuple(slice(start[i], stop[i]) for i in range(3))
-    crop = np.asarray(raw[slices])
-    if crop.shape != pred_shape:
-        raise ValueError(f"Raw crop shape {crop.shape} does not match prediction shape {pred_shape}")
-    return crop
+    raw_level = find_matching_gt_level(raw_path, pred_scale, pred_translation)
+    print(f"Raw alignment: using level {raw_level}")
+    return crop_raw_to_prediction_region(raw_path, raw_level, pred_shape, pred_translation)
 
 
 def print_stats(logits: np.ndarray, classes: list[str]) -> np.ndarray:
@@ -448,7 +562,14 @@ def plot_groundtruth_overlay(raw_crop: np.ndarray, gt: np.ndarray, out_path: Pat
 def main() -> None:
     logits = load_logits(PRED_CROP, CLASSES)
     pred = print_stats(logits, CLASSES)
-    labels = load_binary_labels(GT_CROP, CLASSES, level_path="s1")
+    pred_scale, pred_translation = _read_level_transform(PRED_CROP / CLASSES[0], "s0")
+    labels = load_binary_labels(
+        GT_CROP,
+        CLASSES,
+        logits.shape[1:],
+        pred_scale,
+        pred_translation,
+    )
     gt = print_groundtruth_stats(labels, CLASSES)
     print_accuracy(pred, labels)
     print_monai_dice_metrics(logits, pred, labels)
