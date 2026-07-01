@@ -37,7 +37,7 @@ from cellmap_segmentation_challenge.utils.loss import (
 
 # %% Set hyperparameters and other configurations
 learning_rate = 0.00005  # learning rate for the optimizer
-batch_size = 16  # final valid batch size after patch filtering
+batch_size = 2  # final valid batch size after patch filtering
 input_array_info = {
     "shape": (128, 128, 128),
     "scale": (8, 8, 8),
@@ -90,14 +90,14 @@ validation_wrap_loss = False
 # model = UNet_3D(1, len(classes))
 
 # 3D ResNet
-model_name = "3d_resnet_6class"
-model_to_load = "3d_resnet_6class"
-model = ResNet(ndims=3, output_nc=len(classes))
+# model_name = "3d_resnet_6class"
+# model_to_load = "3d_resnet_6class"
+# model = ResNet(ndims=3, output_nc=len(classes))
 
 # # 3D TransUNet
-# model_name = "3d_transunet_6class"
-# model_to_load = "3d_transunet_6class"
-# model = TransUNet_3D(1, len(classes), img_size=input_array_info["shape"])
+model_name = "3d_transunet_6class"
+model_to_load = "3d_transunet_6class"
+model = TransUNet_3D(1, len(classes), img_size=input_array_info["shape"])
 
 # 3D SegFormer
 # model_name = "3d_segformer_6class"

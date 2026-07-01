@@ -3,13 +3,20 @@ import json
 
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 import zarr
 from matplotlib.colors import ListedColormap
 from matplotlib.patches import Patch
 
+try:
+    from monai.metrics import DiceMetric, SurfaceDiceMetric
+except ImportError:
+    DiceMetric = None
+    SurfaceDiceMetric = None
 
-CROP_ID = "crop139"
-DATASET = "jrc_mus-liver"
+
+CROP_ID = "crop164"
+DATASET = "jrc_mus-kidney"
 
 PRED_CROP = (
     Path(__file__).resolve().parents[1]
@@ -39,6 +46,9 @@ RAW_DATA = (
 )
 CLASSES = ["endo_lum", "cyto", "endo_mem", "pm", "ecs", 'bg']
 COLORS = ["#39a9db", "#50c878", "#f06a6a", "#f2c14e", "#2a9d8f", "#5e4fa2"]
+NS_DICE_DISTANCE_TOLERANCE = 1.0
+CELLMAP_DICE_SMOOTH = 0.02
+CELLMAP_DICE_INCLUDE_BACKGROUND = True
 
 
 def set_pixel_ticks(ax, image: np.ndarray, step: int = 25) -> None:
@@ -174,6 +184,147 @@ def print_groundtruth_stats(labels: np.ndarray, classes: list[str]) -> np.ndarra
     return gt
 
 
+def print_accuracy(pred: np.ndarray, labels: np.ndarray) -> None:
+    label_sum = labels.sum(axis=0)
+    valid = label_sum == 1
+    gt = np.argmax(labels, axis=0)
+
+    if pred.shape != gt.shape:
+        raise ValueError(f"Prediction shape {pred.shape} does not match GT shape {gt.shape}")
+
+    correct = (pred == gt) & valid
+    accuracy = 100.0 * correct.sum() / max(1, valid.sum())
+
+    print()
+    print(
+        f"Accuracy: {correct.sum():,} / {valid.sum():,} valid voxels "
+        f"({accuracy:.4f}%)"
+    )
+
+
+def _format_metric(value: float) -> str:
+    if np.isnan(value):
+        return "nan"
+    return f"{value:.4f}"
+
+
+def class_volume_fractions(labels: np.ndarray) -> np.ndarray:
+    class_counts = labels.reshape(labels.shape[0], -1).sum(axis=1).astype(np.float64)
+    total = float(class_counts.sum())
+    if total <= 0:
+        return np.full(labels.shape[0], np.nan, dtype=np.float64)
+    return class_counts / total
+
+
+def _print_metric_row(
+    name: str,
+    per_class: np.ndarray,
+    class_fractions: np.ndarray | None = None,
+) -> None:
+    per_class = np.asarray(per_class, dtype=np.float64).reshape(-1)
+    mean_value = float(np.nanmean(per_class))
+    total_text = ""
+    if class_fractions is not None:
+        class_fractions = np.asarray(class_fractions, dtype=np.float64).reshape(-1)
+        valid = ~np.isnan(per_class) & ~np.isnan(class_fractions)
+        if valid.any():
+            normalized_fractions = class_fractions[valid] / class_fractions[valid].sum()
+            total_value = float(np.sum(per_class[valid] * normalized_fractions))
+            total_text = f", total_by_gt_volume={_format_metric(total_value)}"
+
+    values = ", ".join(
+        f"{cls}={_format_metric(float(score))}"
+        for cls, score in zip(CLASSES, per_class)
+    )
+    print(f"{name}: mean={_format_metric(mean_value)}{total_text} | {values}")
+
+
+def print_class_volume_weights(labels: np.ndarray) -> np.ndarray:
+    fractions = class_volume_fractions(labels)
+    values = ", ".join(
+        f"{cls}={fraction * 100:.4f}%"
+        for cls, fraction in zip(CLASSES, fractions)
+    )
+    print()
+    print("GT class volume weights for total/global Dice")
+    print(f"These weights are used only for the check.py total_by_gt_volume metric: {values}")
+    return fractions
+
+
+def cellmap_loss_style_dice(logits: np.ndarray, labels: np.ndarray) -> np.ndarray:
+    outputs = torch.from_numpy(logits).float().unsqueeze(0)
+    targets = torch.from_numpy(labels).float().unsqueeze(0)
+    target_indices = targets.argmax(dim=1)
+    target_one_hot = torch.nn.functional.one_hot(
+        target_indices,
+        num_classes=outputs.shape[1],
+    ).movedim(-1, 1)
+    target_one_hot = target_one_hot.to(dtype=outputs.dtype)
+    probabilities = torch.softmax(outputs, dim=1)
+
+    if not CELLMAP_DICE_INCLUDE_BACKGROUND and outputs.shape[1] > 1:
+        probabilities = probabilities[:, :-1]
+        target_one_hot = target_one_hot[:, :-1]
+
+    reduce_dims = tuple(range(2, outputs.ndim))
+    intersection = (probabilities * target_one_hot).sum(dim=reduce_dims)
+    denominator = probabilities.sum(dim=reduce_dims) + target_one_hot.sum(dim=reduce_dims)
+    dice_score = (2 * intersection + CELLMAP_DICE_SMOOTH) / (
+        denominator + CELLMAP_DICE_SMOOTH
+    )
+    return dice_score.squeeze(0).detach().cpu().numpy()
+
+
+def print_monai_dice_metrics(logits: np.ndarray, pred: np.ndarray, labels: np.ndarray) -> None:
+    if DiceMetric is None or SurfaceDiceMetric is None:
+        print()
+        print("MONAI Dice metrics skipped: please install monai in this Python environment.")
+        return
+
+    pred_one_hot = np.eye(len(CLASSES), dtype=np.float32)[pred].transpose(3, 0, 1, 2)
+    gt_one_hot = labels.astype(np.float32)
+    prob_softmax = torch.softmax(torch.from_numpy(logits).float(), dim=0).numpy()
+    class_fractions = print_class_volume_weights(labels)
+
+    pred_tensor = torch.from_numpy(pred_one_hot).unsqueeze(0)
+    gt_tensor = torch.from_numpy(gt_one_hot).unsqueeze(0)
+    prob_tensor = torch.from_numpy(prob_softmax).unsqueeze(0)
+
+    dice = DiceMetric(include_background=True, reduction="mean_batch", ignore_empty=False)
+
+    one_hot_scores = dice(y_pred=pred_tensor, y=gt_tensor).detach().cpu().numpy()
+    dice.reset()
+
+    logits_scores = dice(y_pred=prob_tensor, y=gt_tensor).detach().cpu().numpy()
+    dice.reset()
+
+    ns_dice = SurfaceDiceMetric(
+        class_thresholds=[NS_DICE_DISTANCE_TOLERANCE] * len(CLASSES),
+        include_background=True,
+        reduction="mean_batch",
+    )
+    ns_scores = ns_dice(y_pred=pred_tensor, y=gt_tensor).detach().cpu().numpy()
+    ns_dice.reset()
+
+    print()
+    print("MONAI segmentation metrics")
+    print(
+        "MONAI Logits Dice uses softmax probability maps. The separate "
+        "CellMap loss-style Dice below directly reproduces the Dice formula "
+        "used by CellMapDiceCELoss / CellMapFilteredDynamicWeightedDiceCELoss."
+    )
+    print(f"NS Dice tolerance: {NS_DICE_DISTANCE_TOLERANCE} voxel")
+    _print_metric_row("One-hot Dice", one_hot_scores, class_fractions)
+    _print_metric_row("Logits Dice", logits_scores, class_fractions)
+    cellmap_scores = cellmap_loss_style_dice(logits, labels)
+    print(
+        f"CellMap loss-style Dice smooth={CELLMAP_DICE_SMOOTH}, "
+        f"include_background={CELLMAP_DICE_INCLUDE_BACKGROUND}"
+    )
+    _print_metric_row("CellMap loss-style Dice", cellmap_scores, class_fractions)
+    _print_metric_row("NS Dice", ns_scores, class_fractions)
+
+
 def plot_argmax_slices(
     pred: np.ndarray, out_path: Path, figure_title: str = "Prediction argmax slices"
 ) -> None:
@@ -299,6 +450,8 @@ def main() -> None:
     pred = print_stats(logits, CLASSES)
     labels = load_binary_labels(GT_CROP, CLASSES, level_path="s1")
     gt = print_groundtruth_stats(labels, CLASSES)
+    print_accuracy(pred, labels)
+    print_monai_dice_metrics(logits, pred, labels)
     raw_crop = load_raw_crop(PRED_CROP, RAW_DATA, logits.shape[1:])
 
     out_dir = Path(__file__).resolve().parent
