@@ -17,8 +17,10 @@
 # Once the model is trained, you can use the `predict` function to make predictions on new data using the trained model. See the `predict_3D.py` example for more details.
 
 # %%
+import torch
 from upath import UPath
-
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 from cellmap_segmentation_challenge.models import (
     NNFormer3D,
     ResNet,
@@ -27,12 +29,15 @@ from cellmap_segmentation_challenge.models import (
     UNet_3D,
     ViTVNet,
 )
-from cellmap_segmentation_challenge.utils.loss import CellMapFocalDiceLoss
 from cellmap_segmentation_challenge.utils import get_tested_classes
+from cellmap_segmentation_challenge.utils.loss import (
+    CellMapCrossEntropyLoss,
+    CellMapFilteredDynamicWeightedDiceCELoss,
+)
 
 # %% Set hyperparameters and other configurations
-learning_rate = 0.0002  # learning rate for the optimizer
-batch_size = 1  # batch size for the dataloader
+learning_rate = 0.00005  # learning rate for the optimizer
+batch_size = 2  # final valid batch size after patch filtering
 input_array_info = {
     "shape": (128, 128, 128),
     "scale": (8, 8, 8),
@@ -41,50 +46,67 @@ target_array_info = {
     "shape": (128, 128, 128),
     "scale": (8, 8, 8),
 }  # shape and voxel size of the data to load for the target
-epochs = 100  # number of epochs to train the model for
-iterations_per_epoch = 3  # number of iterations per epoch
+epochs = 200  # number of epochs to train the model for
+iterations_per_epoch = 15  # 150 epochs * 120 iterations ~= a long supercomputer run
 random_seed = 42  # random seed for reproducibility
 
 # classes = ["nuc", "er"]  # list of classes to segment
 # classes = get_tested_classes()  # list of classes to segment
-classes = ["endo_lum", "cyto", "endo_mem", "bg"]
+classes = ["endo_lum", "cyto", "endo_mem", "pm", "ecs", "bg"]
+target_classes = classes
 force_all_classes = True
+# Save all six model classes for explicitly requested numeric crops.
+predict_filter_classes = False
 
-# control for BCE, CE, Dice+CE, and Focal+Dice
-criterion = CellMapFocalDiceLoss
-# criterion_kwargs = {
-#     "alpha": [2.5, 1.5, 2.5, 1.0],  # ["endo_lum", "cyto", "endo_mem", "bg"]
-#     "gamma": 1.0,
-#     "focal_weight": 0.8,
-#     "dice_weight": 0.2,
-# }
-# wrap_loss = False
-# weight_loss = False
+# Formal six-class experiment:
+# 0.4 dynamic inverse-frequency CE + 0.6 Dice.
+# Patches where ecs + bg occupy more than 60% are rejected before model forward.
+patch_filter_class_indices = [4, 5]  # ["ecs", "bg"]
+patch_filter_ratio_threshold = 0.65
+patch_filter_max_attempts = 200
+patch_filter_min_batch_size = 16
+
+criterion = CellMapFilteredDynamicWeightedDiceCELoss
+criterion_kwargs = {
+    "ce_weight": 0.5,
+    "dice_weight": 0.5,
+    "dice_smooth": 0.02,
+    "min_class_weight": 0.1,
+    "max_class_weight": 10.0,
+    "include_background": True,
+}
+wrap_loss = False
+weight_loss = False
+
+# Validation uses plain multi-class CE as a simple unweighted metric.
+validation_criterion = CellMapCrossEntropyLoss
+validation_criterion_kwargs = {}
+validation_wrap_loss = False
 
 # # Defining model (comment out all that are not used)
 # # 3D UNet
-# model_name = "3d_unet"  # name of the model to use
-# model_to_load = "3d_unet"  # name of the pre-trained model to load
+# model_name = "3d_unet_6class"  # keep six-class checkpoints separate
+# model_to_load = "3d_unet_6class"
 # model = UNet_3D(1, len(classes))
 
 # 3D ResNet
-# model_name = "3d_resnet"  # name of the model to use
-# model_to_load = "3d_resnet"  # name of the pre-trained model to load
+# model_name = "3d_resnet_6class"
+# model_to_load = "3d_resnet_6class"
 # model = ResNet(ndims=3, output_nc=len(classes))
 
 # # 3D TransUNet
-model_name = "3d_transunet"  # name of the model to use
-model_to_load = "3d_transunet"  # name of the pre-trained model to load
+model_name = "3d_transunet_6class"
+model_to_load = "3d_transunet_6class"
 model = TransUNet_3D(1, len(classes), img_size=input_array_info["shape"])
 
 # 3D SegFormer
-# model_name = "3d_segformer"
-# model_to_load = "3d_segformer"
+# model_name = "3d_segformer_6class"
+# model_to_load = "3d_segformer_6class"
 # model = SegFormer3D(in_channels=1, num_classes=len(classes))
 
 # 3D nnFormer
-# model_name = "3d_nnformer"
-# model_to_load = "3d_nnformer"
+# model_name = "3d_nnformer_6class"
+# model_to_load = "3d_nnformer_6class"
 # model = NNFormer3D(1, len(classes), img_size=input_array_info["shape"])
 
 load_model = "latest"  # load the latest model or the best validation model
@@ -96,7 +118,7 @@ logs_save_path = UPath(
 model_save_path = UPath(
     "checkpoints/{model_name}_{epoch}.pth"  # path to save the model checkpoints
 ).path
-datasplit_path = "datasplit.csv"  # path to the datasplit file that defines the train/val split the dataloader should use
+datasplit_path = "datasplit_6class.csv"
 
 # Define the spatial transformations to apply to the training data
 spatial_transforms = {  # dictionary of spatial transformations to apply to the data
@@ -106,7 +128,7 @@ spatial_transforms = {  # dictionary of spatial transformations to apply to the 
 }
 
 # Set a limit to how long the validation can take
-validation_time_limit = 25  # time limit in seconds for the validation step
+validation_time_limit = 30  # time limit in seconds for the validation step
 filter_by_scale = True  # filter the data by scale
 
 if __name__ == "__main__":

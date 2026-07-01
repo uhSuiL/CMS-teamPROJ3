@@ -6,7 +6,11 @@ import tempfile
 import os
 from pathlib import Path
 from unittest.mock import Mock, patch, MagicMock
-from cellmap_segmentation_challenge.predict import _predict, predict
+from cellmap_segmentation_challenge.predict import (
+    _append_rejection_background,
+    _predict,
+    predict,
+)
 
 
 class TestPredictFiltering:
@@ -107,6 +111,29 @@ class TestPredictFiltering:
         assert model_class_to_index is None
 
         # This means the filtering block won't execute in _predict
+
+    def test_rejection_background_matches_softmax_threshold(self):
+        logits = torch.tensor(
+            [
+                [
+                    [[3.0, 0.0]],
+                    [[0.0, 0.0]],
+                    [[0.0, 0.0]],
+                ]
+            ]
+        )
+        threshold = 0.5
+
+        outputs = _append_rejection_background(
+            {"output": logits},
+            threshold,
+            "bg",
+        )
+        expanded_logits = outputs["output"]
+        prediction = expanded_logits.argmax(dim=1)
+        max_probability = logits.softmax(dim=1).amax(dim=1)
+
+        assert torch.equal(prediction == 3, max_probability < threshold)
 
 
 class TestPredictValidation:

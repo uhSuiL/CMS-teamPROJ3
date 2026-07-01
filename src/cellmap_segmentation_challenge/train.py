@@ -62,7 +62,10 @@ def train(config_path: str):
         - use_s3: Whether to use the S3 bucket for the datasplit. Default is False.
         - optimizer: PyTorch optimizer to use for training. Default is `torch.optim.RAdam(model.parameters(), lr=learning_rate, decoupled_weight_decay=True)`.
         - criterion: Uninstantiated PyTorch loss function to use for training. Default is `torch.nn.BCEWithLogitsLoss`.
-        - criterion_kwargs: Dictionary of keyword arguments to pass to the loss function constructor. Default is {}.
+        - criterion_kwargs: Dictionary of keyword arguments to pass to the training loss constructor. Default is {}.
+        - validation_criterion: Optional loss function used only for validation. If omitted, validation uses the instantiated training criterion for backward compatibility.
+        - validation_criterion_kwargs: Dictionary of keyword arguments passed to `validation_criterion`. Default is {}.
+        - validation_wrap_loss: Whether to wrap `validation_criterion` with `CellMapLossWrapper`. Default is the value of `wrap_loss`.
         - weight_loss: Whether to weight the loss function by class counts found in the datasets. Default is True.
         - use_mutual_exclusion: Whether to use mutual exclusion to infer labels for unannotated pixels. Default is False.
         - weighted_sampler: Whether to use a sampler weighted by class counts for the dataloader. Default is True.
@@ -112,6 +115,157 @@ def train(config_path: str):
             _clone_tensors(targets),
         )
 
+    def _take_batch_indices(data, indices):
+        """Take selected items along the batch dimension from nested tensors."""
+        if torch.is_tensor(data):
+            return data.index_select(0, indices)
+        if isinstance(data, dict):
+            return {
+                key: _take_batch_indices(value, indices)
+                for key, value in data.items()
+            }
+        if isinstance(data, (list, tuple)):
+            return type(data)(_take_batch_indices(value, indices) for value in data)
+        return data
+
+    def _concat_batch_parts(parts):
+        """Concatenate nested tensors along the batch dimension."""
+        if len(parts) == 1:
+            return parts[0]
+        first = parts[0]
+        if torch.is_tensor(first):
+            return torch.cat(parts, dim=0)
+        if isinstance(first, dict):
+            return {
+                key: _concat_batch_parts([part[key] for part in parts])
+                for key in first
+            }
+        if isinstance(first, (list, tuple)):
+            return type(first)(
+                _concat_batch_parts([part[index] for part in parts])
+                for index in range(len(first))
+            )
+        return first
+
+    def _batch_length(data):
+        if torch.is_tensor(data):
+            return data.shape[0]
+        if isinstance(data, dict):
+            return _batch_length(next(iter(data.values())))
+        if isinstance(data, (list, tuple)):
+            return _batch_length(data[0])
+        raise ValueError("Cannot infer batch length for patch filtering.")
+
+    def _target_ratio_keep_indices(targets, class_indices, threshold):
+        """Return batch indices where selected class channels stay under threshold."""
+        if isinstance(targets, dict):
+            if len(targets) != 1:
+                raise ValueError(
+                    "patch_filter currently expects a single target tensor, "
+                    f"but got {len(targets)} target arrays."
+                )
+            targets = next(iter(targets.values()))
+        if not torch.is_tensor(targets) or targets.ndim < 3:
+            raise ValueError(
+                "patch_filter expects targets with shape (B, C, ...)."
+            )
+
+        channels = targets.shape[1]
+        bad_indices = [
+            index for index in class_indices if index < 0 or index >= channels
+        ]
+        if bad_indices:
+            raise ValueError(
+                f"patch_filter_class_indices {bad_indices} are outside target "
+                f"channel range 0..{channels - 1}."
+            )
+
+        finite_targets = targets.isfinite()
+        valid_voxels = finite_targets.any(dim=1)
+        valid_counts = valid_voxels.flatten(1).sum(dim=1)
+
+        selected = targets[:, list(class_indices)].nan_to_num(0)
+        selected_voxels = selected.sum(dim=1) > 0.5
+        selected_counts = (selected_voxels & valid_voxels).flatten(1).sum(dim=1)
+
+        ratios = torch.zeros(
+            targets.shape[0],
+            device=targets.device,
+            dtype=torch.float32,
+        )
+        non_empty = valid_counts > 0
+        ratios[non_empty] = (
+            selected_counts[non_empty].float() / valid_counts[non_empty].float()
+        )
+        keep = non_empty & (ratios <= threshold)
+        return torch.where(keep)[0], ratios
+
+    def _load_batch_tensors(batch):
+        inputs = get_data_from_batch(batch, input_keys, device)
+        if singleton_dim is not None:
+            inputs = squeeze_singleton_dim(inputs, singleton_dim + 2)
+        targets = get_data_from_batch(batch, target_keys, device)
+        return inputs, targets
+
+    def _next_loader_batch(loader_iter):
+        try:
+            return next(loader_iter), loader_iter
+        except StopIteration:
+            loader_iter = iter(train_loader.loader)
+            return next(loader_iter), loader_iter
+
+    def _collect_filtered_training_batch(loader_iter):
+        """Collect valid patches before model forward according to config."""
+        input_parts = []
+        target_parts = []
+        raw_batch_for_viz = None
+        valid_count = 0
+        attempts = 0
+        rejected_count = 0
+
+        while valid_count < batch_size and attempts < patch_filter_max_attempts:
+            raw_batch, loader_iter = _next_loader_batch(loader_iter)
+            attempts += 1
+            inputs, targets = _load_batch_tensors(raw_batch)
+            keep_indices, _ = _target_ratio_keep_indices(
+                targets,
+                patch_filter_class_indices,
+                patch_filter_ratio_threshold,
+            )
+            rejected_count += int(_batch_length(targets) - keep_indices.numel())
+
+            if keep_indices.numel() > 0:
+                need = batch_size - valid_count
+                keep_indices = keep_indices[:need]
+                input_parts.append(_take_batch_indices(inputs, keep_indices))
+                target_parts.append(_take_batch_indices(targets, keep_indices))
+                valid_count += keep_indices.numel()
+                if raw_batch_for_viz is None:
+                    raw_batch_for_viz = raw_batch
+
+            if keep_indices.numel() == 0:
+                del inputs, targets, raw_batch
+
+        if valid_count < patch_filter_min_batch_size:
+            return None, None, None, loader_iter, attempts, rejected_count
+
+        inputs = _concat_batch_parts(input_parts)
+        targets = _concat_batch_parts(target_parts)
+        return (
+            raw_batch_for_viz,
+            inputs,
+            targets,
+            loader_iter,
+            attempts,
+            rejected_count,
+        )
+
+    def _foreground_targets_for_viz(target_data):
+        """Drop auxiliary target channels that the model does not predict."""
+        if torch.is_tensor(target_data) and target_data.ndim >= 2:
+            return target_data[:, : len(classes)]
+        return target_data
+
     # %% Load the configuration file
     config = load_safe_config(config_path)
     # %% Set hyperparameters and other configurations from the config file
@@ -144,6 +298,7 @@ def train(config_path: str):
     iterations_per_epoch = getattr(config, "iterations_per_epoch", 1000)
     random_seed = getattr(config, "random_seed", getattr(os.environ, "SEED", 42))
     classes = getattr(config, "classes", ["nuc", "er"])
+    target_classes = getattr(config, "target_classes", classes)
     model_name = getattr(config, "model_name", "2d_unet")
     model_to_load = getattr(config, "model_to_load", model_name)
     model_kwargs = getattr(config, "model_kwargs", {})
@@ -191,6 +346,31 @@ def train(config_path: str):
     max_grad_norm = getattr(config, "max_grad_norm", None)
     force_all_classes = getattr(config, "force_all_classes", "validate")
     print("force_all_classes:", force_all_classes)
+    patch_filter_class_indices = getattr(config, "patch_filter_class_indices", None)
+    patch_filter_ratio_threshold = getattr(
+        config,
+        "patch_filter_ratio_threshold",
+        None,
+    )
+    patch_filter_max_attempts = getattr(config, "patch_filter_max_attempts", 50)
+    patch_filter_min_batch_size = getattr(config, "patch_filter_min_batch_size", 1)
+    use_patch_filter = (
+        patch_filter_class_indices is not None
+        and patch_filter_ratio_threshold is not None
+    )
+    if use_patch_filter:
+        patch_filter_class_indices = tuple(patch_filter_class_indices)
+        if not 0.0 <= patch_filter_ratio_threshold <= 1.0:
+            raise ValueError("patch_filter_ratio_threshold must be between 0 and 1")
+        if patch_filter_max_attempts < 1:
+            raise ValueError("patch_filter_max_attempts must be >= 1")
+        if patch_filter_min_batch_size < 1:
+            raise ValueError("patch_filter_min_batch_size must be >= 1")
+        print(
+            "Patch filter enabled: keeping patches with selected-class ratio "
+            f"<= {patch_filter_ratio_threshold}; class indices="
+            f"{patch_filter_class_indices}; target batch_size={batch_size}."
+        )
 
     # %% Define the optimizer, from the config file or default to RAdam
     optimizer = getattr(
@@ -209,9 +389,14 @@ def train(config_path: str):
 
     # %% Define the loss function, from the config file or default to BCEWithLogitsLoss
     criterion = getattr(config, "criterion", torch.nn.BCEWithLogitsLoss)
-    criterion_kwargs = getattr(config, "criterion_kwargs", {})
+    criterion_kwargs = dict(getattr(config, "criterion_kwargs", {}))
     weight_loss = getattr(config, "weight_loss", True)
     wrap_loss = getattr(config, "wrap_loss", True)
+    configured_validation_criterion = getattr(config, "validation_criterion", None)
+    validation_criterion_kwargs = dict(
+        getattr(config, "validation_criterion_kwargs", {})
+    )
+    validation_wrap_loss = getattr(config, "validation_wrap_loss", wrap_loss)
 
     gradient_accumulation_steps = getattr(
         config, "gradient_accumulation_steps", 1
@@ -267,7 +452,7 @@ def train(config_path: str):
         # Make the datasplit CSV
         if use_s3:
             make_s3_datasplit_csv(
-                classes=classes,
+                classes=target_classes,
                 scale=scale,
                 csv_path=datasplit_path,
                 validation_prob=validation_prob,
@@ -275,7 +460,7 @@ def train(config_path: str):
             )
         else:
             make_datasplit_csv(
-                classes=classes,
+                classes=target_classes,
                 scale=scale,
                 csv_path=datasplit_path,
                 validation_prob=validation_prob,
@@ -285,7 +470,7 @@ def train(config_path: str):
     # %% Download the data and make the dataloader
     train_loader, val_loader = get_dataloader(
         datasplit_path=datasplit_path,
-        classes=classes,
+        classes=target_classes,
         batch_size=batch_size,
         input_array_info=input_array_info,
         target_array_info=target_array_info,
@@ -364,9 +549,25 @@ def train(config_path: str):
             pos_weight = pos_weight[..., None]
         criterion_kwargs["pos_weight"] = pos_weight
     if wrap_loss:
-        criterion = CellMapLossWrapper(criterion, **criterion_kwargs)
+        train_criterion = CellMapLossWrapper(criterion, **criterion_kwargs)
     elif isinstance(criterion, type):
-        criterion = criterion(**criterion_kwargs)
+        train_criterion = criterion(**criterion_kwargs)
+    else:
+        train_criterion = criterion
+
+    if configured_validation_criterion is None:
+        validation_criterion = train_criterion
+    elif validation_wrap_loss:
+        validation_criterion = CellMapLossWrapper(
+            configured_validation_criterion,
+            **validation_criterion_kwargs,
+        )
+    elif isinstance(configured_validation_criterion, type):
+        validation_criterion = configured_validation_criterion(
+            **validation_criterion_kwargs
+        )
+    else:
+        validation_criterion = configured_validation_criterion
 
     input_keys = list(train_loader.dataset.input_arrays.keys())
     target_keys = list(train_loader.dataset.target_arrays.keys())
@@ -411,32 +612,55 @@ def train(config_path: str):
         # Training loop for the epoch
         post_fix_dict["Epoch"] = epoch
 
+        train_iter = iter(train_loader.loader)
         epoch_bar = tqdm(
-            train_loader.loader,
+            range(iterations_per_epoch),
             desc="Training",
             dynamic_ncols=True,
             total=iterations_per_epoch,
         )
         optimizer.zero_grad()
-        for epoch_iter, batch in enumerate(epoch_bar):
+        for epoch_iter in epoch_bar:
             # Increment the training iteration
             n_iter += 1
 
+            # Collect a training batch. If configured, reject patches before
+            # forward until a full valid batch is assembled.
+            if use_patch_filter:
+                (
+                    batch,
+                    inputs,
+                    targets,
+                    train_iter,
+                    filter_attempts,
+                    rejected_count,
+                ) = _collect_filtered_training_batch(train_iter)
+                if inputs is None:
+                    post_fix_dict["Skipped"] = (
+                        f"no valid patches in {filter_attempts} attempts"
+                    )
+                    epoch_bar.set_postfix(post_fix_dict)
+                    optimizer.zero_grad()
+                    n_iter -= 1
+                    continue
+                post_fix_dict["Filter"] = (
+                    f"{_batch_length(inputs)}/{batch_size} kept, "
+                    f"{rejected_count} rejected, {filter_attempts} draws"
+                )
+            else:
+                batch, train_iter = _next_loader_batch(train_iter)
+                inputs, targets = _load_batch_tensors(batch)
+
             # Forward pass (compute the model outputs)
-            inputs = get_data_from_batch(batch, input_keys, device)
-            if singleton_dim is not None:
-                inputs = squeeze_singleton_dim(inputs, singleton_dim + 2)
             outputs = model(inputs)
             if singleton_dim is not None:
                 outputs = unsqueeze_singleton_dim(outputs, singleton_dim + 2)
 
             # Compute the loss
-            targets = get_data_from_batch(batch, target_keys, device)
-
             if outputs.ndim == 5 and targets.ndim == 4 and outputs.shape[2] == 1:
                 outputs = outputs.squeeze(2)
 
-            loss = criterion(outputs, targets) / gradient_accumulation_steps
+            loss = train_criterion(outputs, targets) / gradient_accumulation_steps
 
             # Backward pass (compute the gradients)
             loss.backward()
@@ -545,7 +769,7 @@ def train(config_path: str):
                     if outputs.ndim == 5 and targets.ndim == 4 and outputs.shape[2] == 1:
                         outputs = outputs.squeeze(2)
 
-                    val_score += criterion(outputs, targets).item()
+                    val_score += validation_criterion(outputs, targets).item()
                     i += 1
 
                     # Check time limit
@@ -602,7 +826,7 @@ def train(config_path: str):
                 for i, (in_key, target_key) in enumerate(zip(input_keys, target_keys)):
                     figs = get_fig_dict(
                         input_data=batch[in_key],
-                        target_data=batch[target_key],
+                        target_data=_foreground_targets_for_viz(batch[target_key]),
                         outputs=outputs[i],
                         classes=classes,
                     )
@@ -624,7 +848,12 @@ def train(config_path: str):
                     targets = list(targets.values())[0]
                 elif isinstance(targets, list):
                     targets = targets[0]
-                figs = get_fig_dict(inputs, targets, outputs, classes)
+                figs = get_fig_dict(
+                    inputs,
+                    _foreground_targets_for_viz(targets),
+                    outputs,
+                    classes,
+                )
                 for name, fig in figs.items():
                     writer.add_figure(name, fig, n_iter)
                     writer.flush()  # Ensure figures are written to disk

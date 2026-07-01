@@ -1,8 +1,14 @@
 """Unit tests for loss functions in cellmap_segmentation_challenge.utils.loss"""
 
+import pytest
 import torch
+import torch.nn.functional as F
 
-from cellmap_segmentation_challenge.utils.loss import CellMapLossWrapper
+from cellmap_segmentation_challenge.utils.loss import (
+    CellMapDynamicWeightedCrossEntropyLoss,
+    CellMapForegroundCEBackgroundRejectionLoss,
+    CellMapLossWrapper,
+)
 
 
 class TestCellMapLossWrapper:
@@ -127,3 +133,92 @@ class TestCellMapLossWrapper:
         # Loss should be computed only for non-NaN values
         assert not torch.isnan(loss)
         assert loss >= 0  # BCE loss is always non-negative
+
+
+class TestCellMapDynamicWeightedCrossEntropyLoss:
+    def test_patch_weights_balance_active_classes(self):
+        target_indices = torch.tensor([[[0, 0, 0, 0], [0, 0, 1, 1]]])
+        targets = F.one_hot(target_indices, num_classes=4).movedim(-1, 1).float()
+        outputs = torch.randn(1, 4, 2, 4, requires_grad=True)
+
+        loss = CellMapDynamicWeightedCrossEntropyLoss()(outputs, targets)
+        loss.backward()
+
+        assert torch.isfinite(loss)
+        assert torch.isfinite(outputs.grad).all()
+
+    def test_max_class_weight_caps_extreme_inverse_frequency(self):
+        target_indices = torch.cat(
+            [torch.zeros(99, dtype=torch.long), torch.ones(1, dtype=torch.long)]
+        ).reshape(1, 10, 10)
+        targets = F.one_hot(target_indices, num_classes=4).movedim(-1, 1).float()
+        outputs = torch.zeros(1, 4, 10, 10, requires_grad=True)
+
+        loss = CellMapDynamicWeightedCrossEntropyLoss(max_class_weight=25.0)(
+            outputs,
+            targets,
+        )
+
+        assert torch.allclose(loss, torch.log(torch.tensor(4.0)), atol=1e-6)
+
+    def test_min_class_weight_prevents_majority_downweighting(self):
+        target_indices = torch.cat(
+            [torch.zeros(75, dtype=torch.long), torch.ones(25, dtype=torch.long)]
+        ).reshape(1, 10, 10)
+        targets = F.one_hot(target_indices, num_classes=4).movedim(-1, 1).float()
+        outputs = torch.zeros(1, 4, 10, 10, requires_grad=True)
+
+        loss = CellMapDynamicWeightedCrossEntropyLoss(
+            min_class_weight=1.0,
+            max_class_weight=100.0,
+        )(outputs, targets)
+
+        assert torch.allclose(loss, torch.log(torch.tensor(4.0)), atol=1e-6)
+
+
+class TestCellMapForegroundCEBackgroundRejectionLoss:
+    def test_foreground_uses_ordinary_cross_entropy(self):
+        outputs = torch.tensor(
+            [[[[2.0, 0.0]], [[0.0, 2.0]]]],
+            requires_grad=True,
+        )
+        targets = torch.zeros(1, 3, 1, 2)
+        targets[0, 0, 0, 0] = 1
+        targets[0, 1, 0, 1] = 1
+
+        loss = CellMapForegroundCEBackgroundRejectionLoss(
+            background_penalty_weight=0.0
+        )(outputs, targets)
+        expected = F.cross_entropy(
+            outputs,
+            torch.tensor([[[0, 1]]]),
+        )
+
+        assert torch.allclose(loss, expected)
+
+    def test_background_penalizes_only_confidence_above_threshold(self):
+        targets = torch.zeros(1, 3, 1, 2)
+        targets[:, -1] = 1
+        outputs = torch.tensor(
+            [[[[0.0, 4.0]], [[0.0, 0.0]]]],
+            requires_grad=True,
+        )
+
+        loss = CellMapForegroundCEBackgroundRejectionLoss(
+            confidence_threshold=0.6,
+            background_penalty_weight=1.0,
+            penalty_power=2.0,
+        )(outputs, targets)
+        probabilities = F.softmax(outputs, dim=1).amax(dim=1)
+        expected = F.relu(probabilities - 0.6).pow(2).mean()
+
+        assert torch.allclose(loss, expected)
+        loss.backward()
+        assert torch.isfinite(outputs.grad).all()
+
+    def test_requires_one_extra_background_channel(self):
+        outputs = torch.zeros(1, 2, 2, 2)
+        targets = torch.zeros(1, 2, 2, 2)
+
+        with pytest.raises(ValueError, match="plus one bg channel"):
+            CellMapForegroundCEBackgroundRejectionLoss()(outputs, targets)
