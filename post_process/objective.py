@@ -12,7 +12,7 @@ def labeling_cost(C: Tensor, X: Tensor) -> Tensor:
     """
     assert C.shape == X.shape, f'Shape mismatch: {C.shape}, {X.shape}'
     assert C.dim() == X.dim() == 5, f'Dimension mismatch: {C.dim()}, {X.dim()}'
-    return (C * X).sum(dim=(1, 2, 3, 4), keepdim=True)
+    return (C * X).sum(dim=(1, 2, 3, 4), keepdim=True).reshape(-1, 1)
 
 
 # ─────────────────────────────────────────────
