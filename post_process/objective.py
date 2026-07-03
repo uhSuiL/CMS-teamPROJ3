@@ -125,6 +125,55 @@ def adjacency_cost(
 
 
 # ─────────────────────────────────────────────
+# Enclosure Cost
+# ─────────────────────────────────────────────
+
+def compute_escape_count(labels: Tensor, inner_layer_id: int, outer_layer_id: int) -> Tensor:
+    """(N, W, H, D) -> 每个体素的'逃逸邻居'个数（标签既非膜也非胞质的邻居数）"""
+    is_escape = ((labels != inner_layer_id) & (labels != outer_layer_id)).to(torch.float32)
+    is_escape = is_escape.unsqueeze(1)  # (N, 1, W, H, D)
+    kernel = torch.zeros(1, 1, 3, 3, 3, device=labels.device, dtype=is_escape.dtype)
+    kernel[0, 0, 1, 1, 0] = kernel[0, 0, 1, 1, 2] = 1
+    kernel[0, 0, 1, 0, 1] = kernel[0, 0, 1, 2, 1] = 1
+    kernel[0, 0, 0, 1, 1] = kernel[0, 0, 2, 1, 1] = 1
+    return F.conv3d(is_escape, kernel, padding=1).squeeze(1)  # (N, W, H, D)
+
+
+def enclosure_cost(labels: Tensor, inner_layer_id: int, outer_layer_id: int, C_enclose) -> Tensor:
+    escape_count = compute_escape_count(labels, inner_layer_id, outer_layer_id)
+    return C_enclose * (escape_count == 0).float()
+
+
+def local_enclosure_bias(local_cost, labels, forbidden_enclosure_pairs, C_enclose) -> Tensor:
+    enclosure_bias = torch.zeros_like(local_cost)
+    for (inner_layer_id, outer_layer_id) in forbidden_enclosure_pairs:
+        enclosure_bias[..., inner_layer_id] += enclosure_cost(labels, inner_layer_id, outer_layer_id, C_enclose)
+        local_cost = local_cost + enclosure_bias
+    return local_cost
+
+def total_enclosure_cost(
+    labels: Tensor,
+    forbidden_enclosure_pairs: list[tuple[int, int]],
+    C_enclose: float | int = 1e6,
+) -> Tensor:
+    """Scalar enclosure penalty actually incurred by `labels`.
+
+    Mirrors `local_enclosure_bias`: for each forbidden (inner, outer) pair,
+    every voxel currently labeled `inner_layer_id` that has zero non-inner/
+    outer neighbors (i.e. is fully enclosed) contributes `C_enclose`.
+
+    :param labels: (N, W, H, D) int64
+    :return:       (N, 1)
+    """
+    N = labels.shape[0]
+    total = torch.zeros(N, dtype=torch.float32, device=labels.device)
+    for (inner_layer_id, outer_layer_id) in forbidden_enclosure_pairs:
+        penalty = enclosure_cost(labels, C_enclose, inner_layer_id, outer_layer_id)  # (N, W, H, D)
+        is_inner = (labels == inner_layer_id).to(penalty.dtype)
+        total = total + (penalty * is_inner).sum(dim=(1, 2, 3))
+    return total.reshape(-1, 1)
+
+# ─────────────────────────────────────────────
 # Total Cost Builder
 # ─────────────────────────────────────────────
 
