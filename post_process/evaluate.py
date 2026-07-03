@@ -22,6 +22,7 @@ over that cell:
 from pathlib import Path
 
 import numpy as np
+import torch
 import zarr
 
 from post_process import util
@@ -87,6 +88,45 @@ def load_groundtruth_multiclass_aligned(
         for name in class_names
     ]
     return np.stack(channels, axis=-1)
+
+
+def compute_iou(
+    pred_labels: torch.Tensor | np.ndarray,
+    gt_labels: torch.Tensor | np.ndarray,
+    class_names: list[str],
+) -> dict[str, float]:
+    """Per-class IoU (intersection over union) between two voxel label maps.
+
+    :param pred_labels: (W, H, D) integer tensor/array of predicted class ids.
+    :param gt_labels: (W, H, D) integer tensor/array of groundtruth class ids, same shape.
+    :param class_names: class names indexed by label id, i.e. `class_names[i]` is the
+        name of the class with id `i` (as produced by `argmax` over a `(..., len(class_names))`
+        multiclass tensor).
+    :return: {class_name: IoU} for every class present in `pred_labels` or `gt_labels`,
+        plus 'mean_iou' (macro average over those classes). Classes absent from both
+        pred and gt are skipped so they don't inflate the mean.
+    :raises ShapeMismatchError: `pred_labels.shape != gt_labels.shape`.
+    """
+    pred_labels = torch.as_tensor(pred_labels)
+    gt_labels = torch.as_tensor(gt_labels)
+
+    if pred_labels.shape != gt_labels.shape:
+        raise ShapeMismatchError(
+            f"prediction shape {tuple(pred_labels.shape)} != groundtruth shape {tuple(gt_labels.shape)}"
+        )
+
+    iou_per_class = {}
+    for label_id, name in enumerate(class_names):
+        pred_mask = pred_labels == label_id
+        gt_mask = gt_labels == label_id
+        union = torch.count_nonzero(pred_mask | gt_mask)
+        if union == 0:
+            continue
+        intersection = torch.count_nonzero(pred_mask & gt_mask)
+        iou_per_class[name] = (intersection / union).item()
+
+    iou_per_class['mean_iou'] = float(np.mean(list(iou_per_class.values()))) if iou_per_class else 0.0
+    return iou_per_class
 
 
 def compute_crop_accuracy(
