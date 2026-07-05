@@ -139,9 +139,23 @@ def compute_escape_count(labels: Tensor, inner_layer_id: int, outer_layer_id: in
     return F.conv3d(is_escape, kernel, padding=1).squeeze(1)  # (N, W, H, D)
 
 
+def compute_boundary_mask(labels: Tensor) -> Tensor:
+    """(N, W, H, D) bool 掩码，标记体素是否处于图像的空间边界（W/H/D任一维的首末切片）。"""
+    mask = torch.zeros_like(labels, dtype=torch.bool)
+    mask[:, 0, :, :] = True
+    mask[:, -1, :, :] = True
+    mask[:, :, 0, :] = True
+    mask[:, :, -1, :] = True
+    mask[:, :, :, 0] = True
+    mask[:, :, :, -1] = True
+    return mask
+
+
 def enclosure_cost(labels: Tensor, inner_layer_id: int, outer_layer_id: int, C_enclose) -> Tensor:
     escape_count = compute_escape_count(labels, inner_layer_id, outer_layer_id)
-    return C_enclose * (escape_count == 0).float()
+    is_boundary = compute_boundary_mask(labels)
+    # 边界体素缺失的邻居会被 conv3d 的零填充误判为"逃逸邻居数为0"，因此边界体素永远不计入被非法包裹的惩罚。
+    return C_enclose * ((escape_count == 0) & ~is_boundary).float()
 
 
 def local_enclosure_bias(local_cost, labels, forbidden_enclosure_pairs, C_enclose) -> Tensor:
@@ -168,7 +182,7 @@ def total_enclosure_cost(
     N = labels.shape[0]
     total = torch.zeros(N, dtype=torch.float32, device=labels.device)
     for (inner_layer_id, outer_layer_id) in forbidden_enclosure_pairs:
-        penalty = enclosure_cost(labels, C_enclose, inner_layer_id, outer_layer_id)  # (N, W, H, D)
+        penalty = enclosure_cost(labels, inner_layer_id, outer_layer_id, C_enclose)  # (N, W, H, D)
         is_inner = (labels == inner_layer_id).to(penalty.dtype)
         total = total + (penalty * is_inner).sum(dim=(1, 2, 3))
     return total.reshape(-1, 1)
