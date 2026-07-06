@@ -3,7 +3,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from typing import Optional, Callable
 
-from post_process.objective import total_cost, _shift_X, _DIRECTIONS
+from post_process.objective import total_cost, total_enclosure_cost, local_enclosure_bias, _shift_X, _DIRECTIONS
 
 
 def hard_assign(X: Tensor, out_dtype: torch.dtype) -> Tensor:
@@ -60,6 +60,8 @@ def solve_sa(
     step_init: float,
     X_init: Optional[Tensor] = None,
     *,
+    forbidden_enclosure_pairs: Optional[list[tuple[int, int]]] = None,
+    C_enclose: float = 1e6,
     T_init: float = 1.0,
     T_final: float = 1e-4,
     n_iter: int = 200,
@@ -86,6 +88,10 @@ def solve_sa(
     :param C_adj:     (L, L) pairwise adjacency cost matrix
     :param step_init: initial perturbation magnitude
     :param X_init:    optional warm-start logits; defaults to −C_unary
+    :param forbidden_enclosure_pairs: list of (inner_layer_id, outer_layer_id)
+                       pairs that must not fully enclose one another; see
+                       `objective.enclosure_cost`. None disables the term.
+    :param C_enclose: penalty weight applied per forbidden-enclosure violation
     :param T_init:    initial temperature
     :param T_final:   final temperature
     :param n_iter:    number of SA sweeps
@@ -107,7 +113,14 @@ def solve_sa(
     color_a = _checkerboard_mask(W, H, D, device)  # (W, H, D) bool
     masks = [color_a, ~color_a]
 
-    cost = total_cost(C_unary, hard_assign(X, orig_dtype), C_adj)  # (N, 1)
+    def _total_cost(Xh: Tensor) -> Tensor:
+        labels = Xh.argmax(dim=-1)
+        cost = total_cost(C_unary, Xh.to(orig_dtype), C_adj)  # (N, 1)
+        if forbidden_enclosure_pairs:
+            cost = cost + total_enclosure_cost(labels, forbidden_enclosure_pairs, C_enclose)
+        return cost
+
+    cost = _total_cost(Xh)  # (N, 1)
     T = float(T_init)
     decay = (T_final / T_init) ** (1.0 / max(n_iter - 1, 1))
 
@@ -121,6 +134,12 @@ def solve_sa(
 
         for mask in masks:
             field = _local_field(Xh, C_unary64, C_adj64)  # (N, W, H, D, L)
+            if forbidden_enclosure_pairs:
+                # safe as a per-half-step bias: a voxel's escape count only
+                # depends on its (currently fixed) neighbors, never on its
+                # own candidate label.
+                labels = Xh.argmax(dim=-1)
+                field = local_enclosure_bias(field, labels, forbidden_enclosure_pairs, C_enclose)
             cur_e = (Xh * field).sum(dim=-1)               # (N, W, H, D)
             prop_e = (Xh_prop * field).sum(dim=-1)         # (N, W, H, D)
             delta = prop_e - cur_e                          # (N, W, H, D), per-voxel cost change
@@ -135,7 +154,7 @@ def solve_sa(
             X = torch.where(accept_full, X_prop, X)
             Xh = torch.where(accept_full, Xh_prop, Xh)
 
-        cost = total_cost(C_unary, hard_assign(X, orig_dtype), C_adj)  # (N, 1)
+        cost = _total_cost(Xh)  # (N, 1)
 
         T *= decay
 

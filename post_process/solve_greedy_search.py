@@ -33,7 +33,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from typing import Optional
 
-from post_process.objective import total_cost
+from post_process.objective import total_cost, total_enclosure_cost, local_enclosure_bias
 
 # All 6 axis-aligned neighbor directions in 3D: (axis, shift_direction)
 _DIRECTIONS: list[tuple[int, int]] = [
@@ -114,6 +114,8 @@ def solve_greedy(
     C_adj: Tensor,
     X_init: Optional[Tensor] = None,
     *,
+    forbidden_enclosure_pairs: Optional[list[tuple[int, int]]] = None,
+    C_enclose: float = 1e6,
     max_iter: int = 1000,
     verbose: bool = True,
 ) -> Tensor:
@@ -125,6 +127,10 @@ def solve_greedy(
     :param X_init:  optional warm-start logits/one-hot (N, W, H, D, L);
                      defaults to the per-voxel unary-greedy labeling
                      (argmin over C_unary)
+    :param forbidden_enclosure_pairs: list of (inner_layer_id, outer_layer_id)
+                     pairs that must not fully enclose one another; see
+                     `objective.enclosure_cost`. None disables the term.
+    :param C_enclose: penalty weight applied per forbidden-enclosure violation
     :param max_iter: safety cap on the number of queue-processing rounds
     :param verbose:  print progress per round
     :return:         (N, W, H, D, L) one-hot label assignment
@@ -152,6 +158,11 @@ def solve_greedy(
                 continue
 
             local_cost = _local_cost(C_unary, C_adj, labels)         # (N, W, H, D, L)
+            if forbidden_enclosure_pairs:
+                # safe as a per-half-step bias: a voxel's escape count only
+                # depends on its (currently fixed) neighbors, never on its
+                # own candidate label.
+                local_cost = local_enclosure_bias(local_cost, labels, forbidden_enclosure_pairs, C_enclose)
             best_cost, best_label = local_cost.min(dim=-1)           # (N, W, H, D)
             current_cost = local_cost.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
 
@@ -164,6 +175,8 @@ def solve_greedy(
 
         if verbose:
             cost = total_cost(C_unary, F.one_hot(labels, L).to(orig_dtype), C_adj)
+            if forbidden_enclosure_pairs:
+                cost = cost + total_enclosure_cost(labels, forbidden_enclosure_pairs, C_enclose)
             print(f"Round {n_round} | flipped {flipped.sum().item()} | Cost: {cost.mean():.4f}")
 
     if verbose and n_round >= max_iter and active.any():

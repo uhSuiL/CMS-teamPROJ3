@@ -36,16 +36,27 @@ import torch
 from torch import Tensor
 from typing import Optional, Callable
 
-from post_process.objective import total_cost
+from post_process.objective import total_cost, total_enclosure_cost
 from post_process.solve_sa_continuous import hard_assign
 
 
-def _population_cost(C_unary: Tensor, C_adj: Tensor, X_pop: Tensor, orig_dtype: torch.dtype) -> Tensor:
+def _population_cost(
+    C_unary: Tensor,
+    C_adj: Tensor,
+    X_pop: Tensor,
+    orig_dtype: torch.dtype,
+    forbidden_enclosure_pairs: Optional[list[tuple[int, int]]] = None,
+    C_enclose: float = 1e6,
+) -> Tensor:
     """Cost of every particle's hard-assigned labeling.
 
     :param C_unary: (N, W, H, D, L)
     :param C_adj:   (L, L)
     :param X_pop:   (N, P, W, H, D, L) continuous logits
+    :param forbidden_enclosure_pairs: list of (inner_layer_id, outer_layer_id)
+                     pairs that must not fully enclose one another; see
+                     `objective.enclosure_cost`. None disables the term.
+    :param C_enclose: penalty weight applied per forbidden-enclosure violation
     :return:        (N, P) cost of each particle
     """
     N, P, W, H, D, L = X_pop.shape
@@ -54,6 +65,9 @@ def _population_cost(C_unary: Tensor, C_adj: Tensor, X_pop: Tensor, orig_dtype: 
     Xh_pop = hard_assign(X_pop, orig_dtype).reshape(N * P, W, H, D, L)
 
     cost = total_cost(C_unary_pop, Xh_pop, C_adj)  # (N*P, 1)
+    if forbidden_enclosure_pairs:
+        labels_pop = Xh_pop.argmax(dim=-1)  # (N*P, W, H, D)
+        cost = cost + total_enclosure_cost(labels_pop, forbidden_enclosure_pairs, C_enclose)
     return cost.reshape(N, P)
 
 
@@ -74,6 +88,8 @@ def solve_ps(
     C_adj: Tensor,
     X_init: Optional[Tensor] = None,
     *,
+    forbidden_enclosure_pairs: Optional[list[tuple[int, int]]] = None,
+    C_enclose: float = 1e6,
     n_particles: int = 32,
     n_iter: int = 200,
     w_init: float = 0.9,
@@ -102,6 +118,10 @@ def solve_ps(
     :param X_init:     optional warm-start logits (N, W, H, D, L); defaults
                         to -C_unary. One particle is seeded with this value
                         unperturbed; the rest are noisy copies of it.
+    :param forbidden_enclosure_pairs: list of (inner_layer_id, outer_layer_id)
+                        pairs that must not fully enclose one another; see
+                        `objective.enclosure_cost`. None disables the term.
+    :param C_enclose:  penalty weight applied per forbidden-enclosure violation
     :param n_particles: swarm size per batch item
     :param n_iter:     number of PSO iterations
     :param w_init:     initial inertia weight (exploration)
@@ -137,7 +157,7 @@ def solve_ps(
 
     V = torch.empty_like(X).uniform_(-v_init_scale, v_init_scale, generator=generator)
 
-    cost = _population_cost(C_unary64, C_adj64, X, orig_dtype)  # (N, P)
+    cost = _population_cost(C_unary64, C_adj64, X, orig_dtype, forbidden_enclosure_pairs, C_enclose)  # (N, P)
 
     pbest_X = X.clone()
     pbest_cost = cost.clone()
@@ -164,7 +184,7 @@ def solve_ps(
 
         X = X + V
 
-        cost = _population_cost(C_unary64, C_adj64, X, orig_dtype)  # (N, P)
+        cost = _population_cost(C_unary64, C_adj64, X, orig_dtype, forbidden_enclosure_pairs, C_enclose)  # (N, P)
 
         improved = cost < pbest_cost  # (N, P)
         pbest_X = torch.where(improved.view(N, P, 1, 1, 1, 1), X, pbest_X)
