@@ -258,3 +258,29 @@ def greedy_dilate_with_hard_flip(
         X[n] = labels_n[0]
 
     return X
+
+
+def constrained_greedy_dilation(
+    X: Tensor,
+    C_unary: Tensor,
+    C_adj: Tensor,
+    *,
+    forbidden_enclosure_pairs: Optional[list[tuple[int, int]]] = None,
+    C_enclose: float = 1e6,
+    max_iter_per_component: int = 1000,
+    verbose: bool = True,
+):
+    dilated_labels = X
+    for forbidden_inner_label in list(set(l for l, _ in forbidden_enclosure_pairs)):
+        dilated_labels = greedy_dilate_with_hard_flip(
+            dilated_labels.argmax(dim=-1),
+            forbidden_inner_label,
+
+            C_unary.double(),
+            C_adj.double(),
+            forbidden_enclosure_pairs=forbidden_enclosure_pairs,
+            C_enclose=C_enclose,
+            max_iter_per_component=max_iter_per_component,
+            verbose=verbose,
+        )
+    return dilated_labels
