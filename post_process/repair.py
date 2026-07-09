@@ -8,7 +8,7 @@ from scipy import ndimage
 from post_process.objective import (
     total_cost, total_enclosure_cost, compute_escape_count, compute_boundary_mask,
 )
-from post_process.solve_greedy_search import _dilate
+from post_process.solve_greedy_search import _dilate, _DIRECTIONS, _shift_labels
 
 # 3D 6-连通结构 (面邻接), 与 objective.py 中邻接项使用的邻域一致
 _STRUCTURE_6CONN = ndimage.generate_binary_structure(3, 1)
@@ -32,6 +32,12 @@ def _frontier_all_label(labels_n: Tensor, comp_mask: Tensor, target_label: int) 
     return bool((labels_n[frontier] == target_label).all())
 
 
+def _dilate_single_direction(mask: Tensor, axis: int, shift: int) -> Tensor:
+    """(1, W, H, D) bool -> mask 沿单一方向 (axis, shift) 的邻居体素（自身除外）。"""
+    shifted, valid = _shift_labels(mask.to(torch.int64), axis, shift)
+    return shifted.bool() & valid
+
+
 def _dilate_component_greedy(
     labels_n: Tensor,
     C_unary_n: Tensor,
@@ -44,30 +50,44 @@ def _dilate_component_greedy(
     verbose: bool,
     tag: str,
 ) -> Tensor:
-    """对单个连通分量 comp_mask 逐层贪心 dilation，直到无法进一步降低 total_cost。"""
+    """对单个连通分量 comp_mask 逐方向贪心 dilation。
+
+    与 repair.py 中"整层"版本不同：这里依次处理 6 个轴向方向中的一个，在该
+    方向上反复膨胀一层，只要 cost 降低就接受，直到这个方向不能再降低
+    total_cost 为止，再换下一个方向，如此遍历完全部 6 个方向。
+    """
     cur_cost = _total_cost(labels_n, C_unary_n, C_adj, forbidden_enclosure_pairs, C_enclose)
 
-    n_round = 0
-    while n_round < max_iter_per_component:
-        frontier = _dilate(comp_mask) & ~comp_mask & (labels_n != label_l)
-        if not frontier.any():
+    total_round = 0
+    stopped_at_max_iter = False
+
+    for axis, shift in _DIRECTIONS:
+        while total_round < max_iter_per_component:
+            frontier = _dilate_single_direction(comp_mask, axis, shift) & ~comp_mask & (labels_n != label_l)
+            if not frontier.any():
+                break
+
+            candidate = torch.where(frontier, label_l, labels_n)
+            cand_cost = _total_cost(candidate, C_unary_n, C_adj, forbidden_enclosure_pairs, C_enclose)
+
+            if cand_cost >= cur_cost:
+                break
+
+            labels_n = candidate
+            comp_mask = comp_mask | frontier
+            cur_cost = cand_cost
+            total_round += 1
+
+            if verbose:
+                print(f"{tag}: direction ({axis}, {shift:+d}) dilation round {total_round}, cost={cur_cost.item():.4f}")
+        else:
+            stopped_at_max_iter = True
+
+        if total_round >= max_iter_per_component:
+            stopped_at_max_iter = True
             break
 
-        candidate = torch.where(frontier, label_l, labels_n)
-        cand_cost = _total_cost(candidate, C_unary_n, C_adj, forbidden_enclosure_pairs, C_enclose)
-
-        if cand_cost >= cur_cost:
-            break
-
-        labels_n = candidate
-        comp_mask = comp_mask | frontier
-        cur_cost = cand_cost
-        n_round += 1
-
-        if verbose:
-            print(f"{tag}: dilation round {n_round}, cost={cur_cost.item():.4f}")
-
-    if verbose and n_round >= max_iter_per_component:
+    if verbose and stopped_at_max_iter:
         print(f"{tag}: stopped at max_iter_per_component={max_iter_per_component}")
 
     return labels_n
@@ -89,8 +109,7 @@ def _total_cost(
     two genuinely different candidates to compare as bitwise-equal costs.
     """
     L = C_unary.shape[-1]
-    cost = total_cost(C_unary.double(), F.one_hot(labels, L).double(), C_adj.double())
-    # cost = total_cost(C_unary, F.one_hot(labels, L), C_adj)
+    cost = total_cost(C_unary, F.one_hot(labels, L).float(), C_adj)
     if forbidden_enclosure_pairs:
         cost = cost + total_enclosure_cost(labels, forbidden_enclosure_pairs, C_enclose)
     return cost.reshape(())
@@ -108,12 +127,13 @@ def greedy_dilation(
     verbose: bool = True,
 ) -> Tensor:
     """
-    对标签 `label_l` 的每个连通分量做贪心膨胀（dilation）修复。
+    对标签 `label_l` 的每个连通分量做逐方向贪心膨胀（dilation）修复。
 
     Enclosure cost 优化容易把某个连通分量压缩成极窄的"膜"结构（例如只有一层
-    体素厚），这里逐个连通分量地向外膨胀一层，只要膨胀后的 total_cost 比膨胀
-    前更低就接受并继续膨胀，直到某一层膨胀不再降低 total_cost 为止，再处理
-    下一个连通分量。
+    体素厚），这里逐个连通分量、逐个轴向方向地向外膨胀：先在一个方向上反复
+    膨胀一层，只要膨胀后的 total_cost 比膨胀前更低就接受并继续，直到该方向
+    不再降低 total_cost 为止，再换下一个方向，遍历完 6 个方向后处理下一个
+    连通分量。
 
     :param X:         (N, W, H, D) int64，当前标签图
     :param label_l:   需要 dilate 的标签
@@ -312,8 +332,8 @@ def constrained_greedy_dilation(
             dilated_labels,
             forbidden_inner_label,
 
-            C_unary.double(),
-            C_adj.double(),
+            C_unary,
+            C_adj,
             forbidden_enclosure_pairs=forbidden_enclosure_pairs,
             C_enclose=C_enclose,
             max_iter_per_component=max_iter_per_component,
