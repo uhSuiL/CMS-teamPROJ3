@@ -162,7 +162,7 @@ def local_enclosure_bias(local_cost, labels, forbidden_enclosure_pairs, C_enclos
     enclosure_bias = torch.zeros_like(local_cost)
     for (inner_layer_id, outer_layer_id) in forbidden_enclosure_pairs:
         enclosure_bias[..., inner_layer_id] += enclosure_cost(labels, inner_layer_id, outer_layer_id, C_enclose)
-        local_cost = local_cost + enclosure_bias
+    local_cost = local_cost + enclosure_bias
     return local_cost
 
 def total_enclosure_cost(
