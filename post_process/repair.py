@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 from scipy import ndimage
 
 from post_process.objective import (
@@ -197,6 +198,47 @@ def hard_flip(
     return X
 
 
+def _dilate_with_hard_flip_single(
+    n: int,
+    labels_n: Tensor,
+    C_unary_n: Tensor,
+    C_adj: Tensor,
+    label_l: int,
+    outer_ids: list[int],
+    forbidden_enclosure_pairs: Optional[list[tuple[int, int]]],
+    C_enclose: float,
+    max_iter_per_component: int,
+    verbose: bool,
+) -> tuple[int, Tensor]:
+    """对 batch 中第 n 个样本执行 greedy-dilate-with-hard-flip，供线程池并行调用。
+
+    只读取 `labels_n` / `C_unary_n`（均不会被就地修改，每步都产生新 tensor），
+    不写回调用方的 X，因此可以安全地在多个样本间并行执行。
+    """
+    device = labels_n.device
+    components, n_components = _find_components(labels_n[0] == label_l)
+
+    for comp_id in range(1, n_components + 1):
+        comp_mask = _component_mask(components, comp_id, device)  # (1, W, H, D)
+        tag = f"[n={n}] label {label_l} component {comp_id}/{n_components}"
+
+        outer_hit = next(
+            (outer for outer in outer_ids if _frontier_all_label(labels_n, comp_mask, outer)), None
+        )
+        if outer_hit is not None:
+            labels_n = torch.where(comp_mask, outer_hit, labels_n)
+            if verbose:
+                print(f"{tag}: hard-flip -> {outer_hit} ({comp_mask.sum().item()} voxels)")
+            continue
+
+        labels_n = _dilate_component_greedy(
+            labels_n, C_unary_n, C_adj, comp_mask, label_l,
+            forbidden_enclosure_pairs, C_enclose, max_iter_per_component, verbose, tag,
+        )
+
+    return n, labels_n[0]
+
+
 def greedy_dilate_with_hard_flip(
     X: Tensor,
     label_l: int,
@@ -207,10 +249,16 @@ def greedy_dilate_with_hard_flip(
     C_enclose: float = 1e6,
     max_iter_per_component: int = 1000,
     verbose: bool = True,
+    max_workers: Optional[int] = 10,
 ) -> Tensor:
     """结合greedy dilation和hard flip
 
     在greedy dilate中添加hard flip的逻辑,即,当获得一个inner连通分量后,如果所有邻居全部都是outer,则将inner全部覆盖成outer;否则才进行greedy dilate
+
+    batch 内各样本 (N) 相互独立，用 `ThreadPoolExecutor` 并行处理：热点计算落在
+    `scipy.ndimage.label` 和 torch 算子上，二者在实际计算时都会释放 GIL，因此
+    多线程能获得真实的并行收益，且不涉及跨进程搬运/序列化 tensor（尤其是
+    CUDA tensor）的问题。
 
     :param X:         (N, W, H, D) int64，当前标签图
     :param label_l:   需要 dilate 的标签（即 hard flip 意义下的 inner）
@@ -223,39 +271,27 @@ def greedy_dilate_with_hard_flip(
     :param C_enclose: enclosure 违规的惩罚权重
     :param max_iter_per_component: 每个连通分量膨胀轮数的安全上限
     :param verbose:   是否打印每次 flip / dilation 的信息
+    :param max_workers: 并行处理 N 个样本所用的线程数上限；None 时使用
+                      `ThreadPoolExecutor` 的默认值
     :return:          (N, W, H, D) int64，修复后的标签图（不修改输入）
     """
-    device = X.device
     N = X.shape[0]
     X = X.clone().to(torch.int64)
 
     outer_ids = [outer for inner, outer in (forbidden_enclosure_pairs or []) if inner == label_l]
 
-    for n in range(N):
-        labels_n = X[n:n + 1]          # (1, W, H, D)
-        C_unary_n = C_unary[n:n + 1]   # (1, W, H, D, L)
-
-        components, n_components = _find_components(labels_n[0] == label_l)
-
-        for comp_id in range(1, n_components + 1):
-            comp_mask = _component_mask(components, comp_id, device)  # (1, W, H, D)
-            tag = f"[n={n}] label {label_l} component {comp_id}/{n_components}"
-
-            outer_hit = next(
-                (outer for outer in outer_ids if _frontier_all_label(labels_n, comp_mask, outer)), None
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(
+                _dilate_with_hard_flip_single,
+                n, X[n:n + 1], C_unary[n:n + 1], C_adj, label_l, outer_ids,
+                forbidden_enclosure_pairs, C_enclose, max_iter_per_component, verbose,
             )
-            if outer_hit is not None:
-                labels_n = torch.where(comp_mask, outer_hit, labels_n)
-                if verbose:
-                    print(f"{tag}: hard-flip -> {outer_hit} ({comp_mask.sum().item()} voxels)")
-                continue
-
-            labels_n = _dilate_component_greedy(
-                labels_n, C_unary_n, C_adj, comp_mask, label_l,
-                forbidden_enclosure_pairs, C_enclose, max_iter_per_component, verbose, tag,
-            )
-
-        X[n] = labels_n[0]
+            for n in range(N)
+        ]
+        for future in futures:
+            n, labels_n0 = future.result()
+            X[n] = labels_n0
 
     return X
 
@@ -271,9 +307,9 @@ def constrained_greedy_dilation(
     verbose: bool = True,
 ):
     dilated_labels = X
-    for forbidden_inner_label in list(set(l for l, _ in forbidden_enclosure_pairs)):
+    for forbidden_inner_label in dict.fromkeys(l for l, _ in forbidden_enclosure_pairs):
         dilated_labels = greedy_dilate_with_hard_flip(
-            dilated_labels.argmax(dim=-1),
+            dilated_labels,
             forbidden_inner_label,
 
             C_unary.double(),
