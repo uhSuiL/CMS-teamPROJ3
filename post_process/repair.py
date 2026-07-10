@@ -7,6 +7,7 @@ from scipy import ndimage
 
 from post_process.objective import (
     total_cost, total_enclosure_cost, compute_escape_count, compute_boundary_mask,
+    compute_self_neighbor_count,
 )
 from post_process.solve_greedy_search import _dilate, _DIRECTIONS, _shift_labels
 
@@ -214,6 +215,61 @@ def hard_flip(
                     if verbose:
                         print(f"[n={n}] hard_flip: inner={inner_layer_id} -> outer={outer_layer_id}, "
                               f"component {comp_id}/{n_components} ({comp_mask.sum().item()} voxels) flipped")
+
+    return X
+
+
+def probability_dilation(
+    X: Tensor,
+    logits: Tensor,
+    forbidden_enclosure_pairs: list[tuple[int, int]],
+    *,
+    threshold: float = 0.8,
+    min_inner_neighbors: Optional[int] = 4,
+    max_iter: int = 1000,
+    verbose: bool = True,
+) -> Tensor:
+    """
+    :param X:      (N, W, H, D) int64，当前标签图
+    :param logits: (N, W, H, D, L) 每体素每标签的原始 logits（未做 softmax）
+    :param forbidden_enclosure_pairs: (inner_label, outer_label) 列表；对每个
+                      pair 独立地做上述边界概率翻转
+    :param threshold: softmax 概率阈值，超过则翻转，默认 0.8
+    :param min_inner_neighbors: 候选体素自身 6 邻居中已是 inner_label 的数量
+                      达到该值时，即使概率未过阈值也翻转；None 时关闭该松弛
+                      条件，退化为纯概率阈值判据
+    :param max_iter:  每个 pair 扩张轮数的安全上限
+    :param verbose:   是否打印每轮翻转的体素数
+    :return:          (N, W, H, D) int64，修复后的标签图（不修改输入）
+    """
+    X = X.clone().to(torch.int64)
+    probs = F.softmax(logits, dim=-1)  # (N, W, H, D, L)，对所有 pair 只算一次
+
+    for inner_label, outer_label in forbidden_enclosure_pairs:
+        inner_prob = probs[..., inner_label]  # (N, W, H, D)
+        mask = X == inner_label
+
+        n_round = 0
+        while n_round < max_iter:
+            frontier = _dilate(mask) & ~mask & (X == outer_label)
+            flip = frontier & (inner_prob > threshold)
+            if min_inner_neighbors is not None:
+                inner_neighbor_count = compute_self_neighbor_count(X, inner_label)  # (N, W, H, D)
+                flip = flip | (frontier & (inner_neighbor_count >= min_inner_neighbors))
+            if not flip.any():
+                break
+
+            X = torch.where(flip, inner_label, X)
+            mask = mask | flip
+            n_round += 1
+
+            if verbose:
+                print(f"probability_dilation: inner={inner_label} outer={outer_label} "
+                      f"round {n_round}, flipped {flip.sum().item()} voxels")
+        else:
+            if verbose:
+                print(f"probability_dilation: inner={inner_label} outer={outer_label} "
+                      f"stopped at max_iter={max_iter}")
 
     return X
 
